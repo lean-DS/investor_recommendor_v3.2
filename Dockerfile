@@ -1,35 +1,34 @@
-# Dockerfile
-
-# --- Base image ---
+# Use slim Python base
 FROM python:3.11-slim
 
-# --- Set workdir ---
+# Set working directory
 WORKDIR /app
 
-# --- Install system dependencies ---
+# Install system dependencies (needed for some Python libs like Prophet, numpy, etc.)
 RUN apt-get update && apt-get install -y \
     build-essential \
     git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Copy requirements first (for caching layers) ---
+# Copy requirements first (better Docker caching)
 COPY requirements.txt .
 
-# --- Install Python deps ---
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- Copy app code ---
+# Copy rest of the repo
 COPY . .
 
-# --- Expose Streamlit port ---
+# Expose Streamlit port
 EXPOSE 8080
 
-# --- Set Streamlit config for Cloud Run ---
+# Streamlit-specific env vars
 ENV PORT=8080
 ENV STREAMLIT_SERVER_PORT=8080
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_SERVER_ENABLECORS=false
 ENV STREAMLIT_SERVER_ENABLEXSRSFPROTECTION=false
 
-# --- Launch ---
-CMD ["streamlit", "run", "app.py"]
+# Run Streamlit app
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8080"]
