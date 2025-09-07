@@ -75,9 +75,12 @@ def load_sentiment():
 
 # --------- scoring & filtering ----------
 def beta_band(risk):
-    if risk == "Conservative": return (0.0, 1.0)
-    if risk == "Moderate":     return (0.8, 1.2)
-    return (1.0, 1.8)  # Aggressive
+    if risk == "Conservative":
+        return (0.0, 0.8)
+    elif risk == "Moderate":
+        return (0.8, 1.4)
+    else:  # Aggressive
+        return (1.4, 2.5)
 
 def build_feature_score(df, goal):
     # normalize
