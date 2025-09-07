@@ -1,0 +1,11 @@
+steps:
+  # Step 1: Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'europe-west1-docker.pkg.dev/fintech-inv-recomm/portfolio-repo/portfolio-app:latest', '.']
+
+  # Step 2: Push the image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'europe-west1-docker.pkg.dev/fintech-inv-recomm/portfolio-repo/portfolio-app:latest']
+
+images:
+  - 'europe-west1-docker.pkg.dev/fintech-inv-recomm/portfolio-repo/portfolio-app:latest'
