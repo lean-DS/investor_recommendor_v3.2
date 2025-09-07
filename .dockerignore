@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb_checkpoints
+.env
+.venv
+venv/
+build/
+dist/
+.cache/
+**/.DS_Store
+# Don’t bake large local data — you read from GCS at runtime
+data/
+portfolio_data/
