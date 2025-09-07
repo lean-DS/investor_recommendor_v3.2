@@ -45,4 +45,5 @@ steps:
 images:
   - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"
 options:
-  logging: CLOUD_LOGGING_ONLY   # ← satisfies the requirement
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'  # ← satisfies the requirement
