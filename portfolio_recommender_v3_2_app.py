@@ -1,6 +1,6 @@
 
 # app.py — Cloud Run (reads from GCS)
-# app.py (GCS-native)
+# app.py — Cloud Run (reads from GCS)
 import os
 import time
 import numpy as np
@@ -15,23 +15,28 @@ BUCKET = os.environ.get("GCS_DATA_BUCKET", "fintech-inv-recomm-portfolio-data")
 BASE   = os.environ.get("GCS_BASE_PREFIX", "portfolio_data")
 
 def gcs_uri(rel_path: str) -> str:
-    # e.g. gcs_uri("sp500/sp500_features_full.parquet")
     return f"gs://{BUCKET}/{BASE}/{rel_path.lstrip('/')}"
 
 # Equity features & prices
-SPX_FEATURES   = gcs_uri("sp500/sp500_features_full.parquet")
-SPX_PRICES     = gcs_uri("sp500/sp500_prices.parquet")
-FTSE100_FEATURES = gcs_uri("ftse100/ftse100_features_full.parquet")
-FTSE100_PRICES   = gcs_uri("ftse100/ftse100_prices.parquet")
-FTSE250_FEATURES = gcs_uri("ftse250/ftse250_features_full.parquet")
-FTSE250_PRICES   = gcs_uri("ftse250/ftse250_prices.parquet")
+SPX_FEATURES      = gcs_uri("sp500/sp500_features_full.parquet")
+SPX_PRICES        = gcs_uri("sp500/sp500_prices.parquet")
+FTSE100_FEATURES  = gcs_uri("ftse100/ftse100_features_full.parquet")
+FTSE100_PRICES    = gcs_uri("ftse100/ftse100_prices.parquet")
+FTSE250_FEATURES  = gcs_uri("ftse250/ftse250_features_full.parquet")
+FTSE250_PRICES    = gcs_uri("ftse250/ftse250_prices.parquet")
+
+# Optional master files (for names)
+SPX_MASTER        = gcs_uri("sp500/sp500_master.csv")
+FTSE100_MASTER    = gcs_uri("ftse100/ftse100_master.csv")
+FTSE250_MASTER    = gcs_uri("ftse250/ftse250_master.csv")
 
 # ETFs
-ETF_FEATURES = gcs_uri("etf/etf_features.parquet")
-ETF_PRICES   = gcs_uri("etf/etf_prices.parquet")
+ETF_FEATURES      = gcs_uri("etf/etf_features.parquet")
+ETF_PRICES        = gcs_uri("etf/etf_prices.parquet")
+ETF_MASTER        = gcs_uri("etf/etf_master.csv")  # optional; silently ignored if missing
 
-# Sentiment (your sample shows: Ticker, Sentiment, Count)
-SENT_CACHE   = gcs_uri("meta/sentiment_sample.parquet")
+# Sentiment
+SENT_CACHE        = gcs_uri("meta/sentiment_sample.parquet")
 
 # ============== UI helpers ==============
 def zscore(s):
@@ -46,12 +51,11 @@ def rotating_status(messages, delay=0.8):
         time.sleep(delay)
 
 def alpha_from_horizon(hz: str) -> float:
-    if hz == "< 3 years":       return 0.75
-    elif hz == "3–5 years":     return 0.85
-    else:                       return 0.90  # ≥ 5 years
+    if hz == "< 3 years":   return 0.75
+    elif hz == "3–5 years": return 0.85
+    else:                   return 0.90  # ≥ 5 years
 
 def friendly_cols(df: pd.DataFrame) -> pd.DataFrame:
-    # UPDATED: include Ticker/Name and friendlier labels
     rename_map = {
         "ticker": "Ticker",
         "name": "Name",
@@ -68,8 +72,7 @@ def friendly_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
 def equity_target_share_from_age(age: int) -> float:
-    tgt = max(0.2, min(0.9, (100 - age) / 100.0))
-    return float(tgt)
+    return float(max(0.2, min(0.9, (100 - age) / 100.0)))
 
 # ============== Robust GCS readers ==============
 def _read_parquet(uri: str, label: str) -> pd.DataFrame:
@@ -84,25 +87,57 @@ def _read_parquet(uri: str, label: str) -> pd.DataFrame:
         )
         st.stop()
 
-def _read_csv(uri: str, label: str) -> pd.DataFrame:
+def _read_csv_optional(uri: str) -> pd.DataFrame | None:
     try:
         return pd.read_csv(uri)
-    except Exception as e:
-        st.error(
-            f"Missing or unreadable CSV for **{label}**:\n\n`{uri}`\n\nError: {e}"
-        )
-        st.stop()
+    except Exception:
+        return None  # silently ignore if not present
+
+# ============== Names (master join) ==============
+def _extract_name_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize a 'name' column if master contains any common name field.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ticker", "name"])
+    cands = [c for c in ["Name", "Company", "Security", "LongName", "Instrument", "Description"] if c in df.columns]
+    name_col = cands[0] if cands else None
+    tick_col = "Ticker" if "Ticker" in df.columns else ("ticker" if "ticker" in df.columns else None)
+    if not tick_col:
+        return pd.DataFrame(columns=["ticker", "name"])
+    out = df[[tick_col]].copy()
+    out["ticker"] = out[tick_col].astype(str).str.upper()
+    out["name"] = df[name_col] if name_col else np.nan
+    return out[["ticker", "name"]].drop_duplicates("ticker")
+
+def _attach_names(features_df: pd.DataFrame, which: str) -> pd.DataFrame:
+    """
+    Merge 'name' onto features using the appropriate master CSV if available.
+    """
+    masters = {
+        "sp500": SPX_MASTER,
+        "ftse100": FTSE100_MASTER,
+        "ftse250": FTSE250_MASTER,
+        "etf": ETF_MASTER
+    }
+    m_df = _read_csv_optional(masters.get(which, ""))
+    names = _extract_name_column(m_df)
+    feat = features_df.copy()
+    # ensure ticker uppercase before merge
+    if "ticker" in feat.columns:
+        feat["ticker"] = feat["ticker"].astype(str).str.upper()
+    if not names.empty:
+        feat = feat.merge(names, on="ticker", how="left")
+    else:
+        # if features already carry a name-like column, standardize it
+        alt = [c for c in ["Name", "Company", "Security", "LongName"] if c in feat.columns]
+        if alt:
+            feat = feat.rename(columns={alt[0]: "name"})
+        else:
+            feat["name"] = feat.get("name", np.nan)
+    return feat
 
 # ============== Loaders (standardize beta columns) ==============
-def _normalize_name_column(df: pd.DataFrame) -> pd.DataFrame:
-    """NEW: create a 'name' column if any common name field exists."""
-    name_cols = [c for c in ["Name", "Company", "Security", "LongName"] if c in df.columns]
-    if name_cols:
-        df = df.rename(columns={name_cols[0]: "name"})
-    else:
-        df["name"] = np.nan
-    return df
-
 @st.cache_data(show_spinner=False)
 def _load_equity_features(which: str) -> pd.DataFrame:
     if which == "sp500":
@@ -115,8 +150,9 @@ def _load_equity_features(which: str) -> pd.DataFrame:
         raise ValueError(f"unknown equity bucket: {which}")
 
     df = df.copy()
-    df.rename(columns={"Ticker": "ticker"}, inplace=True)
-    df = _normalize_name_column(df)  # <— NEW
+    if "Ticker" in df.columns:
+        df.rename(columns={"Ticker": "ticker"}, inplace=True)
+    df["ticker"] = df["ticker"].astype(str).str.upper()
 
     # ensure expected cols exist
     for c in ["Mom_6M", "Mom_12M", "Vol_252d", "Dividend_Yield_TTM", "AvgVol_60d"]:
@@ -124,12 +160,19 @@ def _load_equity_features(which: str) -> pd.DataFrame:
             df[c] = np.nan
 
     # unify beta
-    if "Beta_vs_Benchmark" not in df.columns and "Beta_vs_SPY" in df.columns:
-        df.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"}, inplace=True)
     if "Beta_vs_Benchmark" not in df.columns:
-        df["Beta_vs_Benchmark"] = np.nan
+        if "Beta_vs_SPY" in df.columns:
+            df.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"}, inplace=True)
+        elif "Beta_vs_ISF.L" in df.columns:
+            df.rename(columns={"Beta_vs_ISF.L": "Beta_vs_Benchmark"}, inplace=True)
+        elif "Beta" in df.columns:
+            df.rename(columns={"Beta": "Beta_vs_Benchmark"}, inplace=True)
+        else:
+            df["Beta_vs_Benchmark"] = np.nan
 
     df["asset_type"] = "Equity"
+    # attach names from master
+    df = _attach_names(df, which)
     return df
 
 @st.cache_data(show_spinner=False)
@@ -159,17 +202,26 @@ def load_universe(index_choice: str):
         eq = _load_equity_features(index_choice)
 
     etf = _read_parquet(ETF_FEATURES, "ETF features").copy()
-    etf.rename(columns={"Ticker": "ticker"}, inplace=True)
-    etf = _normalize_name_column(etf)  # <— NEW
+    if "Ticker" in etf.columns:
+        etf.rename(columns={"Ticker": "ticker"}, inplace=True)
+    etf["ticker"] = etf["ticker"].astype(str).str.upper()
 
+    # attach names for ETFs if master exists
+    etf = _attach_names(etf, "etf")
+
+    # ensure expected cols exist
     for c in ["Mom_6M", "Mom_12M", "Vol_252d", "Dividend_Yield_TTM", "AvgVol_60d"]:
         if c not in etf.columns:
             etf[c] = np.nan
 
-    if "Beta_vs_Benchmark" not in etf.columns and "Beta_vs_SPY" in etf.columns:
-        etf.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"}, inplace=True)
+    # unify beta
     if "Beta_vs_Benchmark" not in etf.columns:
-        etf["Beta_vs_Benchmark"] = np.nan
+        if "Beta_vs_SPY" in etf.columns:
+            etf.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"}, inplace=True)
+        elif "Beta" in etf.columns:
+            etf.rename(columns={"Beta": "Beta_vs_Benchmark"}, inplace=True)
+        else:
+            etf["Beta_vs_Benchmark"] = np.nan
 
     etf["asset_type"] = "ETF"
     return eq, etf
@@ -194,20 +246,18 @@ def load_prices(index_choice: str, include_etf: bool = True) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_sentiment():
-    # Your sample: columns ['Ticker','Sentiment','Count']
-    s = _read_parquet(SENT_CACHE, "Sentiment cache (FinBERT)")
-    s = s.copy()
-    # normalize
+    # Accepts many schemas; normalizes to ['ticker','sentiment_z']
+    s = _read_parquet(SENT_CACHE, "Sentiment cache (FinBERT)").copy()
     cols = {c.lower(): c for c in s.columns}
-    if "ticker" in cols:
-        tick_col = cols["ticker"]
-    else:
-        tick_col = "Ticker" if "Ticker" in s.columns else s.columns[0]
 
+    # find ticker column
+    tick_col = cols.get("ticker", "Ticker" if "Ticker" in s.columns else s.columns[0])
+    # find sentiment score column
     if "sentiment" in cols:
         val_col = cols["sentiment"]
     else:
-        val_col = "Sentiment" if "Sentiment" in s.columns else s.columns[1]
+        cand = [c for c in s.columns if "sentiment" in c.lower() or "score" in c.lower()]
+        val_col = cand[0] if cand else (s.columns[1] if len(s.columns) > 1 else s.columns[0])
 
     s = s.rename(columns={tick_col: "ticker", val_col: "sentiment"})
     s["ticker"] = s["ticker"].astype(str).str.upper()
@@ -286,7 +336,6 @@ def rescale_group_weights(weights: pd.Series, group: pd.Series, target_share: fl
     return w / w.sum()
 
 # ============== UI ==============
-
 with st.sidebar:
     st.header("Your Preferences")
     index_choice = st.selectbox("Universe", ["SP500", "FTSE100", "FTSE250", "All"], index=0)
@@ -297,6 +346,12 @@ with st.sidebar:
     include_etf = st.toggle("Include ETFs (recommended)", value=True)
     amount = st.number_input("Investment Amount (USD)", min_value=1000.0, value=10000.0, step=500.0)
     st.caption("ETFs help neutralize risk; we include a default top-10 sleeve.")
+
+    # NEW: one-click cache refresh to force fresh reads from GCS
+    if st.button("↻ Refresh data from GCS"):
+        st.cache_data.clear()
+        st.success("Cache cleared. Reloading freshest data from GCS…")
+        st.experimental_rerun()
 
 if st.button("Build my portfolio"):
     spinner = st.empty()
@@ -311,10 +366,8 @@ if st.button("Build my portfolio"):
     idx_map = {"SP500": "sp500", "FTSE100": "ftse100", "FTSE250": "ftse250", "All": "all"}
     idx = idx_map[index_choice]
 
-    eq, etf = load_universe(idx)
-    spinner.info(next(rot))
-    sent = load_sentiment()
-    spinner.info(next(rot))
+    eq, etf = load_universe(idx); spinner.info(next(rot))
+    sent = load_sentiment();      spinner.info(next(rot))
     px = load_prices(idx, include_etf=include_etf)
 
     # candidates
@@ -329,7 +382,7 @@ if st.button("Build my portfolio"):
     mat = (px.query("Ticker in @use_tickers")[["Date","Ticker","Close"]]
            .pivot(index="Date", columns="Ticker", values="Close")
            .sort_index()
-           .pct_change()
+           .pct_change(fill_method=None)
            .dropna(how="all"))
     mat = mat.dropna(axis=1, thresh=int(0.6*len(mat)))
     keep = [t for t in blended["ticker"] if t in mat.columns]
@@ -351,6 +404,7 @@ if st.button("Build my portfolio"):
     res["weight"] = w_adj.values
     res["alloc_$"] = (res["weight"] * amount).round(2)
 
+    # Portfolio beta (weighted Beta_vs_Benchmark)
     res["Beta_contrib"] = res["weight"] * res["Beta_vs_Benchmark"].fillna(1.0)
     port_beta = float(res["Beta_contrib"].sum())
 
@@ -362,7 +416,7 @@ if st.button("Build my portfolio"):
         f"Summary: {eq_n} Equities, {etf_n} ETFs · Target Equity Share ≈ {target_equity_share:.0%} · Portfolio Beta ≈ {port_beta:.2f}"
     )
 
-    # UPDATED: show Name alongside Ticker
+    # Show Name next to Ticker
     show_cols = [
         "ticker", "name", "asset_type", "weight", "alloc_$",
         "Beta_vs_Benchmark", "Mom_6M", "Mom_12M",
@@ -381,6 +435,23 @@ if st.button("Build my portfolio"):
         }),
         use_container_width=True
     )
+
+    # Data-health quick check (collapsed)
+    def summarize_beta(df: pd.DataFrame, label: str):
+        total = len(df)
+        miss = int(df["Beta_vs_Benchmark"].isna().sum()) if "Beta_vs_Benchmark" in df.columns else total
+        st.write(f"**{label}** → missing Beta: {miss} / {total} ({(miss/total if total else 0):.1%})")
+
+    with st.expander("Data health (debug)", expanded=False):
+        if idx == "all":
+            e_spx  = _load_equity_features("sp500")
+            e_f100 = _load_equity_features("ftse100")
+            e_f250 = _load_equity_features("ftse250")
+            summarize_beta(e_spx,  "SP500")
+            summarize_beta(e_f100, "FTSE100")
+            summarize_beta(e_f250, "FTSE250")
+        else:
+            summarize_beta(eq, idx.upper())
 
     st.caption(
         "Notes: long-only; per-name cap 10%; equity/ETF split uses (100 − age) rule; "
