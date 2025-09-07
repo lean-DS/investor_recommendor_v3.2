@@ -8,19 +8,23 @@ Original file is located at
 """
 
 # app.py
+# Streamlit Personalized Portfolio Builder
+
 import os
 import time
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pathlib import Path
 
-# --- CONFIG: point to your Drive paths ---
-BASE = Path("/content/drive/MyDrive/portfolio_data")  # change to wherever you mounted
-SPX_FEATURES = BASE/"sp500/sp500_features_full.parquet"
-SPX_PRICES   = BASE/"sp500/sp500_prices.parquet"
-ETF_FEATURES = BASE/"etf/etf_features.parquet"
-SENT_CACHE   = BASE/"meta/sentiment_sample.parquet"   # your cached FinBERT outputs
+# GCS access via gcsfs
+import gcsfs
+
+# --- CONFIG: GCS bucket/prefix ---
+BUCKET = os.getenv("GCS_DATA_BUCKET", "fintech-inv-recomm-portfolio-data")
+PREFIX = os.getenv("GCS_BASE_PREFIX", "portfolio_data")
+
+def gcs_path(*parts):
+    return f"gs://{BUCKET}/{PREFIX}/" + "/".join(parts)
 
 # --------- small helpers ----------
 def zscore(s):
@@ -31,7 +35,6 @@ def bounded(x, lo=0.0, hi=1.0):
     return np.clip(x, lo, hi)
 
 def rotating_status(messages, delay=0.8):
-    """Yield a rotating human-friendly status line."""
     i = 0
     while True:
         yield messages[i % len(messages)]
@@ -40,38 +43,31 @@ def rotating_status(messages, delay=0.8):
 
 # --------- load data ----------
 @st.cache_data(show_spinner=False)
-def load_universe():
-    eq = pd.read_parquet(SPX_FEATURES)
-    etf = pd.read_parquet(ETF_FEATURES)
-    # Normalize column names we use
-    for df in (eq, etf):
-        df.rename(columns={"Ticker":"ticker"}, inplace=True)
-    return eq, etf
+def load_universe(index_choice):
+    features = pd.read_parquet(gcs_path(index_choice, f"{index_choice}_features_full.parquet"))
+    prices = pd.read_parquet(gcs_path(index_choice, f"{index_choice}_prices.parquet"))
+    features.rename(columns={"Ticker":"ticker"}, inplace=True)
+    prices["Date"] = pd.to_datetime(prices["Date"])
+    return features, prices
 
 @st.cache_data(show_spinner=False)
-def load_prices():
-    px = pd.read_parquet(SPX_PRICES)
-    # ensure clean pivots: Date, Close, Ticker
-    px["Date"] = pd.to_datetime(px["Date"])
-    return px
+def load_etfs():
+    df = pd.read_parquet(gcs_path("etf", "etf_features.parquet"))
+    df.rename(columns={"Ticker":"ticker"}, inplace=True)
+    return df
 
 @st.cache_data(show_spinner=False)
-def load_sentiment():
-    if SENT_CACHE.exists():
-        s = pd.read_parquet(SENT_CACHE)
-        # expect columns: ticker, sentiment_mean (or score)
-        # adapt here if your schema differs
-        cols = {c.lower(): c for c in s.columns}
-        # try to find a score column
-        cand = [c for c in s.columns if "sentiment" in c.lower() or "score" in c.lower()]
-        score_col = cand[0] if cand else s.columns[-1]
-        s = s.rename(columns={score_col: "sentiment"})
+def load_sentiment(index_choice):
+    try:
+        s = pd.read_csv(gcs_path(index_choice, "news/latest_aggregates.csv"))
+        s.rename(columns={c: c.lower() for c in s.columns}, inplace=True)
+        if "ticker" not in s.columns or "sentiment" not in s.columns:
+            return pd.DataFrame(columns=["ticker","sentiment_z"])
         s["ticker"] = s["ticker"].str.upper()
-        s = s.groupby("ticker", as_index=False)["sentiment"].mean()
-        # zscore for comparability
         s["sentiment_z"] = zscore(s["sentiment"])
         return s[["ticker","sentiment_z"]]
-    return pd.DataFrame(columns=["ticker","sentiment_z"])
+    except Exception:
+        return pd.DataFrame(columns=["ticker","sentiment_z"])
 
 # --------- scoring & filtering ----------
 def beta_band(risk):
@@ -79,122 +75,78 @@ def beta_band(risk):
         return (0.0, 0.8)
     elif risk == "Moderate":
         return (0.8, 1.4)
-    else:  # Aggressive
+    else:
         return (1.4, 2.5)
 
 def build_feature_score(df, goal):
-    # normalize
     mom = zscore(df["Mom_6M"]).fillna(0)*0.6 + zscore(df["Mom_12M"]).fillna(0)*0.4
     div = zscore(df["Dividend_Yield_TTM"]).fillna(0)
-    vol = -zscore(df["Vol_252d"]).fillna(0)  # less volatile = better
-    # weights by goal
+    vol = -zscore(df["Vol_252d"]).fillna(0)
     if goal == "Capital Growth":
         score = 0.55*mom + 0.35*vol + 0.10*div
     elif goal == "Dividend Income":
         score = 0.50*div + 0.35*vol + 0.15*mom
-    else:  # Balanced
+    else:
         score = 0.40*mom + 0.40*vol + 0.20*div
     return score
 
-def filter_candidates(eq, risk, include_etf, goal, top_equities=40, top_etfs=10):
+def filter_candidates(eq, risk, goal, top_equities=40):
     lo, hi = beta_band(risk)
-    eqc = eq.copy()
-    eqc = eqc[(eqc["Beta_vs_SPY"]>=lo) & (eqc["Beta_vs_SPY"]<=hi)]
-    eqc = eqc[eqc["AvgVol_60d"] > 200_000]  # liquidity floor
+    eqc = eq[(eq["Beta_vs_SPY"]>=lo) & (eq["Beta_vs_SPY"]<=hi)]
+    eqc = eqc[eqc["AvgVol_60d"] > 200_000]
     eqc["feature_score"] = build_feature_score(eqc, goal)
-    eqc = eqc.sort_values("feature_score", ascending=False).head(top_equities)
+    return eqc.sort_values("feature_score", ascending=False).head(top_equities)
 
-    etf_sel = pd.DataFrame()
-    if include_etf:
-        # small ETF shortlist: prefer fixed income for conservative, equity otherwise
-        # we already have an ETF features table with Beta_vs_Benchmark, Dividend, Vol etc.
-        etf = pd.read_parquet(ETF_FEATURES)
-        etf.rename(columns={"Ticker":"ticker"}, inplace=True)
-        etf["feature_score"] = build_feature_score(etf.rename(columns={
-            "Beta_vs_Benchmark":"Beta_vs_SPY"  # reuse function; name only
-        }), goal)
-        etf_sel = etf.sort_values("feature_score", ascending=False).head(top_etfs)
-
-    return eqc, etf_sel
+def filter_etfs(etf, goal, top_etfs=10):
+    etf["feature_score"] = build_feature_score(
+        etf.rename(columns={"Beta_vs_Benchmark":"Beta_vs_SPY"}), goal
+    )
+    return etf.sort_values("feature_score", ascending=False).head(top_etfs)
 
 def blend_with_sentiment(df, sent, alpha=0.8):
-    out = df.merge(sent, how="left", left_on="ticker", right_on="ticker")
+    out = df.merge(sent, how="left", on="ticker")
     out["sentiment_z"] = out["sentiment_z"].fillna(0.0)
-    # z-score the feature score too (for scale parity)
     out["feature_z"] = zscore(out["feature_score"])
     out["final_score"] = alpha*out["feature_z"] + (1-alpha)*out["sentiment_z"]
     return out.sort_values("final_score", ascending=False)
 
 # --------- MPT optimizer ----------
 def max_sharpe_longonly(returns_df, rf=0.015, max_w=0.10, n_iter=6000, seed=42):
-    """
-    Very fast stochastic search for max-Sharpe under:
-      - w >= 0, sum w = 1, w_i <= max_w
-    Good enough for 50-60 names in <1s; deterministic if seed fixed.
-    """
     rng = np.random.default_rng(seed)
     X = returns_df.fillna(0).to_numpy()
-    mu = X.mean(axis=0) * 252.0  # annualized mean
+    mu = X.mean(axis=0) * 252.0
     cov = np.cov(X, rowvar=False) * 252.0
-
-    def portfolio_stats(w):
-        ret = float(w @ mu)
-        vol = float(np.sqrt(w @ cov @ w + 1e-12))
-        sharpe = (ret - rf) / (vol + 1e-9)
-        return ret, vol, sharpe
-
     best = (None, -1e9)
     n = X.shape[1]
+
     for _ in range(n_iter):
         w = rng.random(n)
         w = w / w.sum()
-        # cap
         if (w > max_w).any():
-            # project: split overweight across rest
             over = (w - max_w).clip(min=0)
             w -= over
             w = w / w.sum()
-        ret, vol, sh = portfolio_stats(w)
+        ret = float(w @ mu)
+        vol = float(np.sqrt(w @ cov @ w + 1e-12))
+        sh = (ret - rf) / (vol + 1e-9)
         if sh > best[1]:
             best = (w, sh)
     return best[0], mu, cov
 
-# --------- optional BL tilt ----------
-def black_litterman_mu(mu_prior, cov, sentiments, tickers, tau=0.05, view_strength=0.02):
-    """
-    Simple BL: prior = mu_prior, views from sentiment_z (scaled).
-    No market cap required; 'Q' is proportional to sentiment; P = I.
-    """
-    n = len(mu_prior)
-    mu0 = mu_prior.reshape(-1,1)
-    Omega = view_strength * np.diag(np.diag(cov))  # diag noise
-    P = np.eye(n)
-    # make Q by mapping ticker->sentiment_z scale to annualized points
-    s_map = {t: sentiments.get(t, 0.0) for t in tickers}
-    Q = np.array([s_map[t] for t in tickers], dtype=float).reshape(-1,1) * 0.01  # 1% per z-score
-    Sigma = cov
-
-    mid = np.linalg.inv(tau*np.linalg.multi_dot([P, Sigma, P.T]) + Omega)
-    mu_post = mu0 + tau * Sigma @ P.T @ mid @ (Q - P @ mu0)
-    return mu_post.flatten()
-
 # --------- UI ----------
 st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
-st.title("📈 Personalized Portfolio Builder (MPT + optional BL tilt)")
+st.title("📈 Personalized Portfolio Builder")
 
 with st.sidebar:
     st.header("Your Preferences")
+    index_choice = st.selectbox("Index Universe", ["sp500","ftse100","ftse250"], index=0)
     age = st.slider("Age", 18, 80, 32)
-    horizon = st.selectbox("Investment Horizon", ["< 3 years", "3–5 years", "≥ 5 years"], index=1)
-    risk = st.selectbox("Risk Appetite", ["Conservative", "Moderate", "Aggressive"], index=1)
-    goal = st.selectbox("Primary Goal", ["Capital Growth", "Dividend Income", "Balanced"], index=0)
+    risk = st.selectbox("Risk Appetite", ["Conservative","Moderate","Aggressive"], index=1)
+    goal = st.selectbox("Primary Goal", ["Capital Growth","Dividend Income","Balanced"], index=0)
     include_etf = st.toggle("Include ETFs", value=True)
     amount = st.number_input("Investment Amount (USD)", min_value=1000.0, value=10000.0, step=500.0)
-    use_bl = st.toggle("Apply Black–Litterman Sentiment Tilt", value=True)
     alpha = st.slider("Feature vs Sentiment blend (α)", 0.5, 1.0, 0.8, 0.05)
-    st.caption("Higher α = rely more on fundamentals/features, lower α = more sentiment influence.")
 
-# Action
 if st.button("Build my portfolio"):
     spinner = st.empty()
     msgs = [
@@ -206,86 +158,44 @@ if st.button("Build my portfolio"):
     rot = rotating_status(msgs, delay=0.9)
 
     spinner.info(next(rot))
-
-    eq, etf = load_universe()
-    sent = load_sentiment()
-
-    spinner.info(next(rot))
-    eq_40, etf_10 = filter_candidates(eq, risk, include_etf, goal, 40, 10)
+    eq, prices = load_universe(index_choice)
+    etf = load_etfs()
+    sent = load_sentiment(index_choice)
 
     spinner.info(next(rot))
-    # blend sentiment with feature score
+    eq_40 = filter_candidates(eq, risk, goal, 40)
+    etf_10 = filter_etfs(etf, goal, 10) if include_etf else pd.DataFrame()
+
+    spinner.info(next(rot))
     cand = pd.concat([eq_40, etf_10], ignore_index=True)
     blended = blend_with_sentiment(cand, sent, alpha=alpha)
 
-    # prices → returns matrix aligned to our tickers
     spinner.info(next(rot))
-    px = load_prices()
-    use_tickers = blended["ticker"].tolist()
-    mat = (px
-           .query("Ticker in @use_tickers")[["Date","Ticker","Close"]]
+    mat = (prices.query("Ticker in @blended['ticker']")
            .pivot(index="Date", columns="Ticker", values="Close")
            .sort_index()
            .pct_change()
            .dropna(how="all"))
-    # drop columns with too few points
     mat = mat.dropna(axis=1, thresh=int(0.6*len(mat)))
-
-    # align tickers between blended & returns
     keep = [t for t in blended["ticker"] if t in mat.columns]
     blended = blended[blended["ticker"].isin(keep)].reset_index(drop=True)
     mat = mat[keep]
 
-    # MPT max Sharpe (long-only, capped)
-    spinner.info("Optimizing weights with Modern Portfolio Theory…")
-    w0, mu, cov = max_sharpe_longonly(mat, rf=0.015, max_w=0.10, n_iter=6000, seed=42)
-
-    w_final = w0.copy()
-    if use_bl:
-        spinner.info("Applying Black–Litterman tilt from sentiment…")
-        # build simple sentiment dict
-        sent_map = dict(zip(sent["ticker"], sent["sentiment_z"])) if not sent.empty else {}
-        mu_bl = black_litterman_mu(mu, cov, sent_map, mat.columns.tolist(),
-                                   tau=0.05, view_strength=0.02)
-        # re-optimize with tilted μ, using same Σ
-        # quick reuse: scale returns to match mu_bl for the random search scoring
-        # (hack: replace mu in memory for the optimizer)
-        def max_sharpe_with_mu(mu_new, cov, rf=0.015, max_w=0.10, n_iter=4000, seed=7):
-            rng = np.random.default_rng(seed)
-            n = len(mu_new)
-            best = (None, -1e9)
-            for _ in range(n_iter):
-                w = rng.random(n)
-                w = w / w.sum()
-                if (w > max_w).any():
-                    over = (w - max_w).clip(min=0)
-                    w -= over
-                    w = w / w.sum()
-                ret = float(w @ mu_new)
-                vol = float(np.sqrt(w @ cov @ w + 1e-12))
-                sh = (ret - rf) / (vol + 1e-9)
-                if sh > best[1]:
-                    best = (w, sh)
-            return best[0]
-
-        w_final = max_sharpe_with_mu(mu_bl, cov, rf=0.015, max_w=0.10, n_iter=4000, seed=7)
+    spinner.info("Optimizing weights with MPT…")
+    w_final, mu, cov = max_sharpe_longonly(mat)
 
     res = blended.copy()
     res["weight"] = w_final
     res = res.sort_values("weight", ascending=False).head(15).reset_index(drop=True)
     res["alloc_$"] = (res["weight"] * amount).round(2)
 
-    spinner.success("Portfolio ready! 🎉")
+    spinner.success("Initial filteration Completed!")
 
-    # display
     cols_show = ["ticker","weight","alloc_$","Beta_vs_SPY","Mom_6M","Mom_12M",
                  "Dividend_Yield_TTM","sentiment_z","final_score"]
     present = [c for c in cols_show if c in res.columns]
-    st.subheader("Top 15 (MPT{}):".format(" + BL tilt" if use_bl else ""))
     st.dataframe(res[present].style.format({
         "weight":"{:.2%}", "alloc_$":"${:,.0f}",
         "Beta_vs_SPY":"{:.2f}", "Mom_6M":"{:.2%}", "Mom_12M":"{:.2%}",
         "Dividend_Yield_TTM":"{:.2%}", "final_score":"{:.2f}"
     }), use_container_width=True)
-
-    st.caption("Note: weights capped at 10% per name; long-only; μ/Σ from recent daily returns.")
