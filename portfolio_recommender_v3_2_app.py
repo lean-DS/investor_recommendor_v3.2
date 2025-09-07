@@ -24,6 +24,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
+st.title("📈 Personalized Portfolio Builder")
+
 # ============== GCS CONFIG ==============
 BUCKET = os.environ.get("GCS_DATA_BUCKET", "fintech-inv-recomm-portfolio-data")
 BASE   = os.environ.get("GCS_BASE_PREFIX", "portfolio_data")
