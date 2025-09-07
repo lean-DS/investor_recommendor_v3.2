@@ -8,155 +8,271 @@ Original file is located at
 """
 
 # sentiment_utils.py
-# Minimal RSS → FinBERT sentiment helper (no external APIs)
-# Usage in app.py:
-#   from sentiment_utils import fetch_and_score_sentiment
-#   agg_df, articles_df = fetch_and_score_sentiment([("AAPL","Apple Inc.")])
+# ---------------------------------------------------------------------
+# Pure utilities for news sentiment:
+# - Fetch Google News RSS per (ticker, name)
+# - Score with FinBERT (label × prob → [-1, 1])
+# - Time-decay aggregate with 7-day half-life (configurable)
+# - Return (aggregates_df, articles_df) with the exact columns you use:
+#     Aggregates: Ticker | Sentiment | Count
+#     Articles:   Ticker | published_at | title | score | link
+#
+# NOTE: This module does NO file IO. Your collector/app can save the returned DFs.
+# ---------------------------------------------------------------------
 
 from __future__ import annotations
-import re, time, urllib.parse
-from pathlib import Path
-from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+
+import os
+import math
+import time
+import re
+from datetime import datetime, timezone, timedelta
+from typing import Iterable, List, Sequence, Tuple
 
 import pandas as pd
-import numpy as np
 import feedparser
 
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
+# -----------------------
+# Configuration (env-tunable, defaults align with your current code)
+# -----------------------
+FINBERT_MODEL      = os.getenv("FINBERT_MODEL", "ProsusAI/finbert")
+HALF_LIFE_DAYS     = float(os.getenv("HALF_LIFE_DAYS", "7.0"))
+PER_TICKER_MAX_ROWS= int(os.getenv("PER_TICKER_MAX_ROWS", "12"))
+POLITE_DELAY_SEC   = float(os.getenv("POLITE_DELAY_SEC", "0.20"))
+MAX_TOTAL_TEXTS    = int(os.getenv("MAX_TOTAL_TEXTS", "4000"))  # safeguard on cold starts
 
-# -------------------- Config (adjust in app if needed) --------------------
-DEFAULT_LOCALE = dict(hl="en-GB", gl="GB", ceid="GB:en")
-HALF_LIFE_DAYS = 7.0           # time-decay for daily aggregate
-PER_TICKER_MAX_ROWS = 12       # cap headlines scored per ticker
-POLITE_DELAY_SEC = 0.2         # small delay between tickers
+# Google News locale (same as your files)
+DEFAULT_LOCALE = {
+    "hl":  os.getenv("GN_HL",  "en-GB"),
+    "gl":  os.getenv("GN_GL",  "GB"),
+    "ceid":os.getenv("GN_CEID","GB:en")
+}
 
-# -------------------- Internals --------------------
-_PIPE: TextClassificationPipeline | None = None
-
-def _now_utc():
+# -----------------------
+# Small helpers
+# -----------------------
+def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def _coerce_utc(s: pd.Series) -> pd.Series:
+    try:
+        out = pd.to_datetime(s, utc=True, errors="coerce")
+        return out
+    except Exception:
+        # fallback empty series
+        return pd.to_datetime([], utc=True)
+
+_WS_RE = re.compile(r"\s+")
+def _clean(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    return _WS_RE.sub(" ", s.replace("\u00a0", " ").replace("\u200b", " ")).strip()
+
 def _build_query(ticker: str, name: str) -> str:
-    """Quoted company name + ticker + base (.L stripped), joined with OR."""
-    base = ticker.replace(".L", "")
-    nm = re.sub(r"[^\w\s\.\-&]", "", (name or "")).strip()
-    parts = []
-    if nm:
-        parts.append(f"\"{nm}\"")
-    parts.extend([ticker, base])
-    # dedupe while preserving order
-    parts = [p for i, p in enumerate(parts) if p and p not in parts[:i]]
-    return " OR ".join(parts)
+    # same spirit as your code: include both ticker + company + the word 'stock'
+    t = (ticker or "").strip().upper()
+    n = (name or "").strip()
+    return f"{t} {n} stock".strip()
 
 def _google_news_rss(query: str, since_hours: int, locale: dict = DEFAULT_LOCALE) -> pd.DataFrame:
-    params = dict(q=query, **locale)
-    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-        params, quote_via=urllib.parse.quote_plus
+    """
+    Pull Google News RSS for a given query. Keep items within since_hours window when possible.
+    """
+    url = (
+        "https://news.google.com/rss/search"
+        f"?q={query}"
+        f"&hl={locale.get('hl','en-GB')}"
+        f"&gl={locale.get('gl','GB')}"
+        f"&ceid={locale.get('ceid','GB:en')}"
     )
-    d = feedparser.parse(url)
+    feed = feedparser.parse(url)
     rows = []
-    cutoff = _now_utc() - timedelta(hours=since_hours)
-    for e in d.entries:
-        pub = getattr(e, "published_parsed", None)
-        if not pub:
-            continue
-        pub_dt = datetime(*pub[:6], tzinfo=timezone.utc)
-        if pub_dt < cutoff:
-            continue
-        title = getattr(e, "title", "") or ""
-        link = getattr(e, "link", "") or ""
-        rows.append({"title": title, "link": link, "published_at": pub_dt})
-    return pd.DataFrame(rows)
+    cutoff = _now_utc() - timedelta(hours=int(since_hours))
+    for e in feed.entries[:100]:
+        title = _clean(getattr(e, "title", ""))
+        link = getattr(e, "link", "")
+        published = getattr(e, "published", "") or getattr(e, "updated", "")
+        # Convert to UTC if possible
+        try:
+            published_dt = pd.to_datetime(published, utc=True, errors="coerce")
+        except Exception:
+            published_dt = pd.NaT
+        rows.append({
+            "title": title,
+            "link": link,
+            "published_at": published_dt
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["published_at"] = _coerce_utc(df["published_at"])
+    # If many items, prefer within window
+    if df["published_at"].notna().any():
+        df = df.sort_values("published_at", ascending=False)
+        window = df[df["published_at"] >= cutoff]
+        if not window.empty:
+            df = window
+    return df
 
-def _get_pipe(model_name: str = "yiyanghkust/finbert-tone") -> TextClassificationPipeline:
+# -----------------------
+# FinBERT scoring
+# -----------------------
+_PIPE = None
+def _get_pipe():
     global _PIPE
     if _PIPE is not None:
         return _PIPE
-    tok = AutoTokenizer.from_pretrained(model_name)
-    mdl = AutoModelForSequenceClassification.from_pretrained(model_name)
-    device_id = 0 if torch.cuda.is_available() else -1
-    _PIPE = TextClassificationPipeline(
-        model=mdl, tokenizer=tok,
-        device=device_id,
-        top_k=None,               # modern replacement for return_all_scores=True
-        truncation=True, max_length=128, batch_size=32
-    )
+    # Lazy import to keep cold start low
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+    tok = AutoTokenizer.from_pretrained(FINBERT_MODEL)
+    mdl = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL)
+    _PIPE = pipeline("text-classification", model=mdl, tokenizer=tok, truncation=True)
     return _PIPE
 
-def _score_finbert(texts: List[str]) -> List[float]:
+def _label_to_base(label: str) -> float:
+    lab = (label or "").upper()
+    if "POS" in lab:
+        return 1.0
+    if "NEG" in lab:
+        return -1.0
+    return 0.0  # neutral
+
+def _score_finbert(texts: Sequence[str]) -> List[float]:
+    """Return list of [-1,1] scores computed as (base_label in {-1,0,1}) × probability."""
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
     if not texts:
         return []
     pipe = _get_pipe()
-    preds = pipe(texts)  # list[list[{'label','score'}]]
-    out = []
-    for p in preds:
-        d = {d['label'].lower(): d['score'] for d in p}
-        pos = d.get('positive', 0.0); neg = d.get('negative', 0.0)
-        s = (pos - neg + 1.0) / 2.0           # map to [0,1], 0.5 = neutral
-        out.append(float(np.clip(s, 0.0, 1.0)))
-    return out
+    # safeguard very large batches on first run
+    texts = texts[:MAX_TOTAL_TEXTS]
+    out = pipe(texts, truncation=True)
+    scores = []
+    for it in out:
+        base = _label_to_base(it.get("label", ""))
+        prob = float(it.get("score", 1.0))
+        scores.append(base * prob)
+    return scores
 
-def _aggregate_decay(df: pd.DataFrame, half_life_days: float = HALF_LIFE_DAYS) -> float:
-    """Time-decayed mean of per-article scores; neutral (0.5) if empty."""
+# -----------------------
+# Time-decay aggregation
+# -----------------------
+def _exp_decay_weight(dt_series: pd.Series, now: datetime, half_life_days: float) -> pd.Series:
+    """
+    Compute exponential decay weights with half-life in days:
+        w = 0.5 ** (age_days / half_life_days)
+    """
+    age = (now - dt_series).dt.total_seconds() / 86400.0
+    age = age.clip(lower=0).fillna(0.0)
+    hl  = max(1e-6, float(half_life_days))
+    w   = pd.Series(0.5) ** (age / hl)
+    return w
+
+def _aggregate_decay(df: pd.DataFrame, half_life_days: float = HALF_LIFE_DAYS) -> Tuple[float, int]:
+    """
+    Weighted mean of per-headline scores with exponential time-decay.
+    Returns (sentiment, count).
+    """
     if df.empty:
-        return 0.5
+        return 0.5, 0  # neutral when nothing
+    if "score" not in df.columns or df["score"].isna().all():
+        return 0.5, 0
+    df = df.dropna(subset=["score", "published_at"]).copy()
+    if df.empty:
+        return 0.5, 0
     now = _now_utc()
-    age_days = (now - df["published_at"]).dt.total_seconds() / 86400.0
-    w = (0.5 ** (age_days / half_life_days)).clip(0, 1)
-    s = (df["score"].clip(0.05, 0.95) * w).sum()
-    denom = w.sum() if w.sum() > 0 else 1.0
-    return float(s / denom)
+    w = _exp_decay_weight(df["published_at"], now, half_life_days)
+    wsum = float(w.sum())
+    if wsum <= 0:
+        return 0.5, 0
+    s = float((df["score"] * w).sum()) / wsum
+    # s is already in [-1,1]; you later normalize to [0,1] if needed.
+    # Here we keep your convention of returning it centered at 0 (then you can map 0.5 as neutral if desired).
+    count = int(len(df))
+    # If you prefer [0,1] at this stage: s = 0.5 * (s + 1)
+    return s, count
 
-# -------------------- Public API --------------------
+# -----------------------
+# Main entry: fetch + score + aggregate for many tickers
+# -----------------------
 def fetch_and_score_sentiment(
-    tickers_names: List[Tuple[str, str]],
+    tickers_names: Sequence[Tuple[str, str]],
     primary_hours: int = 48,
     fallback_hours: int = 7*24,
     print_headlines: int = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
+    For each (ticker, name), fetch Google News, keep up to PER_TICKER_MAX_ROWS most recent,
+    score with FinBERT, and compute a time-decayed aggregate.
+
     Returns:
-      aggregates_df: columns = [Ticker, Sentiment, Count]
-      articles_df:   columns = [Ticker, published_at, title, score, link]
-    Behavior:
-      - Try Google News RSS for last `primary_hours`; if empty, `fallback_hours`.
-      - If still empty, neutral 0.5.
-      - Scores headlines with FinBERT; aggregates with time-decay.
+      aggregates_df: columns = ['Ticker','Sentiment','Count']
+      articles_df:   columns = ['Ticker','published_at','title','score','link']
     """
-    all_agg, all_articles = [], []
+    agg_rows: List[dict] = []
+    art_frames: List[pd.DataFrame] = []
 
-    for ticker, name in tickers_names:
-        try:
-            q = _build_query(ticker, name)
-            df = _google_news_rss(q, since_hours=primary_hours)
-            if df.empty:
-                df = _google_news_rss(q, since_hours=fallback_hours)
+    for (ticker, name) in tickers_names:
+        tkr = (ticker or "").strip().upper()
+        nm  = (name or "").strip()
 
-            if df.empty:
-                all_agg.append({"Ticker": ticker, "Sentiment": 0.5, "Count": 0})
-                continue
+        # 1) fetch recent
+        q = _build_query(tkr, nm)
+        df = _google_news_rss(q, since_hours=primary_hours, locale=DEFAULT_LOCALE)
+        if df.empty:
+            # fallback to 7 days
+            df = _google_news_rss(q, since_hours=fallback_hours, locale=DEFAULT_LOCALE)
 
-            df = df.sort_values("published_at", ascending=False).head(PER_TICKER_MAX_ROWS).reset_index(drop=True)
-            df["score"] = _score_finbert(df["title"].tolist())
-            agg = _aggregate_decay(df)
-
-            if print_headlines > 0:
-                print(f"{ticker} N={len(df)} agg={agg:.3f}")
-                for _, r in df.head(print_headlines).iterrows():
-                    print("   ", f"{r['score']:.3f}", r["title"][:110])
-
-            df["Ticker"] = ticker
-            all_articles.append(df[["Ticker","published_at","title","score","link"]])
-            all_agg.append({"Ticker": ticker, "Sentiment": agg, "Count": len(df)})
-
+        if df.empty:
+            # no headlines → neutral fallback
+            agg_rows.append({"Ticker": tkr, "Sentiment": 0.5, "Count": 0})
             time.sleep(POLITE_DELAY_SEC)
-        except Exception:
-            all_agg.append({"Ticker": ticker, "Sentiment": 0.5, "Count": 0})
+            continue
 
-    agg = pd.DataFrame(all_agg).sort_values("Sentiment", ascending=False).reset_index(drop=True)
-    art = pd.concat(all_articles, ignore_index=True) if all_articles else pd.DataFrame(
-        columns=["Ticker","published_at","title","score","link"]
+        # 2) keep newest N rows
+        df = df.sort_values("published_at", ascending=False).head(PER_TICKER_MAX_ROWS).copy()
+
+        # 3) score with FinBERT (title only, same as your code)
+        texts = df["title"].fillna("").tolist()
+        scores = _score_finbert(texts)
+        # align length in rare cases
+        if len(scores) != len(df):
+            # pad or trim
+            if len(scores) < len(df):
+                scores = scores + [0.0] * (len(df) - len(scores))
+            else:
+                scores = scores[:len(df)]
+        df["score"] = scores
+
+        if print_headlines > 0:
+            print(f"\n[{tkr}] {len(df)} headlines:")
+            for i, r in df.head(print_headlines).iterrows():
+                print(f"  - {r['published_at']:%Y-%m-%d %H:%M} | {r['title']} | score={r['score']:.3f}")
+
+        # 4) aggregate time-decayed score
+        s, n = _aggregate_decay(df[["published_at", "score"]])
+
+        agg_rows.append({"Ticker": tkr, "Sentiment": s, "Count": n})
+
+        # 5) attach ticker + keep minimal columns you use downstream
+        df_out = df[["published_at", "title", "score"]].copy()
+        df_out.insert(0, "Ticker", tkr)
+        # we can include a link if available (kept in _google_news_rss)
+        if "link" in df.columns:
+            df_out["link"] = df["link"].values
+        else:
+            df_out["link"] = ""
+        art_frames.append(df_out)
+
+        # Be polite to RSS
+        time.sleep(POLITE_DELAY_SEC)
+
+    aggregates = pd.DataFrame(agg_rows, columns=["Ticker", "Sentiment", "Count"])
+    articles = pd.concat(art_frames, ignore_index=True) if art_frames else pd.DataFrame(
+        columns=["Ticker", "published_at", "title", "score", "link"]
     )
-    return agg, art
+
+    # Ensure types
+    if not articles.empty:
+        articles["published_at"] = _coerce_utc(articles["published_at"])
+
+    return aggregates, articles
