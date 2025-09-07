@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc g++ make \
-    libatlas-base-dev liblapack-dev libblas-dev \
+    libopenblas-dev liblapack-dev libblas-dev \
     libgomp1 curl git \
     && rm -rf /var/lib/apt/lists/*
 
