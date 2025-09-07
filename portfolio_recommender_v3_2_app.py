@@ -303,8 +303,6 @@ def rescale_group_weights(weights: pd.Series, group: pd.Series, target_share: fl
     return w / w.sum()
 
 # ============== UI ==============
-st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
-st.title("📈 Personalized Portfolio Builder")
 
 with st.sidebar:
     st.header("Your Preferences")
