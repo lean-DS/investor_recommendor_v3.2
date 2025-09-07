@@ -6,29 +6,47 @@ substitutions:
   _PROJECT: "fintech-inv-recomm"
 
 steps:
-  # Build the Docker image
+  # Try to pull last image to seed the cache (won’t fail the build if missing)
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-lc"
+      - |
+        docker pull ${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest || true
+
+  # Build using the pulled image as a cache source
   - name: "gcr.io/cloud-builders/docker"
     args:
       [
         "build",
+        "--cache-from",
+        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
         "-t",
         "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
+        "-t",
+        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
         ".",
       ]
 
-  # Push the image
+  # Push both the new digest and the latest tag
   - name: "gcr.io/cloud-builders/docker"
     args:
       [
         "push",
         "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
       ]
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "push",
+        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
+      ]
 
   # Deploy to Cloud Run
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: gcloud
     args:
-       [
+      [
         "run","deploy","${_SERVICE}",
         "--image","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
         "--region","${_REGION}",
@@ -38,11 +56,11 @@ steps:
         "--memory","512Mi",
         "--cpu","1",
         "--concurrency","80",
-        "--min-instances","0",
-        "--max-instances","3"
       ]
 
 images:
   - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"
+  - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest"
+
 options:
-  logging: CLOUD_LOGGING_ONLY # ← satisfies the requirement
+  logging: CLOUD_LOGGING_ONLY
