@@ -7,76 +7,186 @@ Original file is located at
     https://colab.research.google.com/drive/1CVvDk2zwCPEbMKDJRS-KNfC4FpQxnHAb
 """
 
-# Minimal per-index sentiment runner → saves into sp500/news, ftse100/news, ftse250/news
+# news_sentiment_collector.py
+# ---------------------------------------------------------------
+# Batch runner for news sentiment:
+# - loads index universe (Ticker + Name/Company) from GCS
+# - fetches Google News, FinBERT-scores, time-decay aggregates
+# - writes:
+#     gs://<BUCKET>/<PREFIX>/<INDEX>/news/latest_aggregates.csv
+#     gs://<BUCKET>/<PREFIX>/<INDEX>/news/YYYY-MM-DD.csv
+#     gs://<BUCKET>/<PREFIX>/meta/sentiment_articles.parquet  (append+dedupe)
+# ---------------------------------------------------------------
 
-from google.colab import drive
-drive.mount('/content/drive')
+from __future__ import annotations
+
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import PurePosixPath
+from typing import List, Tuple
 
 import pandas as pd
-from pathlib import Path
-from datetime import datetime, timezone
-from sentiment_utils import fetch_and_score_sentiment  # from your module
+import fsspec
 
-BASE = Path("/content/drive/MyDrive/portfolio_data")
+from sentiment_utils import fetch_and_score_sentiment  # uses your exact logic/columns
 
-def run_for(master_csv: Path, out_dir: Path, limit: int|None = None,
-            primary_hours=48, fallback_hours=7*24):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    snap_dir = out_dir / "snapshots" / datetime.now(timezone.utc).date().isoformat()
-    snap_dir.mkdir(parents=True, exist_ok=True)
+# -----------------------
+# Config via ENV
+# -----------------------
+GCS_DATA_BUCKET = os.getenv("GCS_DATA_BUCKET", "fintech-inv-recomm-portfolio-data")
+GCS_BASE_PREFIX = os.getenv("GCS_BASE_PREFIX", "portfolio_data")
 
-    if not master_csv.exists():
-        print(f"SKIP: {master_csv} not found")
+# Which index to run (folder names under <PREFIX>/)
+INDEX_NAME      = os.getenv("INDEX_NAME", "sp500")   # e.g., "sp500", "ftse100", "ftse250"
+
+# Path to universe CSV (under the index folder). Override via env if needed.
+# We’ll auto-detect common master filenames if not set.
+UNIVERSE_CSV    = os.getenv("UNIVERSE_CSV", "")      # e.g., "gs://.../sp500/sp500_master.csv"
+
+# polite delay between RSS queries (aligning to your utils defaults)
+POLITE_DELAY_SEC = float(os.getenv("POLITE_DELAY_SEC", "0.20"))
+
+# -----------------------
+# Path helpers
+# -----------------------
+def _join(*parts: str) -> str:
+    return str(PurePosixPath(*parts))
+
+def gs_path(*parts: str) -> str:
+    return f"gs://{GCS_DATA_BUCKET}/{_join(GCS_BASE_PREFIX, *parts)}"
+
+def index_path(*parts: str) -> str:
+    # gs://BUCKET/PREFIX/INDEX_NAME/<...>
+    return gs_path(INDEX_NAME, *parts)
+
+# Canonical write locations
+def path_latest_aggregates() -> str:
+    return index_path("news", "latest_aggregates.csv")
+
+def path_daily_articles() -> str:
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return index_path("news", f"{day}.csv")
+
+def path_articles_parquet_meta() -> str:
+    # central, global articles cache the app can read
+    return gs_path("meta", "sentiment_articles.parquet")
+
+# -----------------------
+# Universe loader
+# -----------------------
+def detect_universe_uri() -> str:
+    """If UNIVERSE_CSV not provided, pick a common default based on INDEX_NAME."""
+    if UNIVERSE_CSV:
+        return UNIVERSE_CSV
+    candidates = {
+        "sp500":  "sp500/sp500_master.csv",
+        "ftse100":"ftse100/ftse100_master.csv",
+        "ftse250":"ftse250/ftse250_master.csv",
+    }
+    key = candidates.get(INDEX_NAME.lower())
+    if key is None:
+        raise ValueError(f"Unknown index '{INDEX_NAME}'. Set UNIVERSE_CSV explicitly.")
+    return gs_path(key)
+
+def load_universe_pairs(uri: str) -> List[Tuple[str, str]]:
+    """
+    Read the universe CSV and return [(Ticker, Name)] pairs.
+    Accepts common column variants: Ticker/ticker & Name/name/Company/company.
+    """
+    df = pd.read_csv(uri)
+    # find ticker column
+    tick_col = None
+    for c in df.columns:
+        if c.strip().lower() in ("ticker", "symbol", "epic"):
+            tick_col = c
+            break
+    if tick_col is None:
+        raise ValueError(f"No ticker column found in {uri}. Expected one of: Ticker/Symbol/EPIC")
+
+    # find name/company column
+    name_col = None
+    for c in df.columns:
+        if c.strip().lower() in ("name", "company"):
+            name_col = c
+            break
+    if name_col is None:
+        # if missing, use ticker as a fallback name (FinBERT still works on ticker-only queries)
+        name_col = tick_col
+
+    df = df[[tick_col, name_col]].dropna()
+    df[tick_col] = df[tick_col].astype(str).str.upper().str.strip()
+    df[name_col] = df[name_col].astype(str).str.strip()
+
+    pairs = list(df.itertuples(index=False, name=None))
+    return [(t, n) for (t, n) in pairs if t]
+
+# -----------------------
+# IO helpers
+# -----------------------
+def write_csv_gs(df: pd.DataFrame, uri: str) -> None:
+    # robust write to gs:// using fsspec
+    with fsspec.open(uri, "w") as f:
+        df.to_csv(f, index=False)
+
+def read_parquet_if_exists(uri: str) -> pd.DataFrame | None:
+    try:
+        return pd.read_parquet(uri)
+    except Exception:
+        return None
+
+def write_parquet_gs(df: pd.DataFrame, uri: str) -> None:
+    df.to_parquet(uri, index=False)
+
+# -----------------------
+# Main runner
+# -----------------------
+def run() -> None:
+    uni_uri = detect_universe_uri()
+    print(f"[collector] Index={INDEX_NAME} | Universe: {uni_uri}")
+    pairs = load_universe_pairs(uni_uri)
+    if not pairs:
+        print("[collector] Universe empty; nothing to do.")
         return
 
-    df = pd.read_csv(master_csv)
-    cols = {c.lower(): c for c in df.columns}
-    tcol = cols.get("ticker") or "ticker"
-    ncol = cols.get("name") or cols.get("company") or "name"
-    uni = df[[tcol, ncol]].copy()
-    uni.columns = ["Ticker","Name"]
-    uni["Ticker"] = uni["Ticker"].astype(str).str.upper().str.strip()
-    uni["Name"]   = uni["Name"].astype(str).str.strip()
-    if limit: uni = uni.head(limit)
-
-    agg, arts = fetch_and_score_sentiment(
-        list(uni[["Ticker","Name"]].itertuples(index=False, name=None)),
-        primary_hours=primary_hours,
-        fallback_hours=fallback_hours,
-        print_headlines=0,
+    # Fetch + score + aggregate (uses your exact utils logic)
+    aggregates_df, articles_df = fetch_and_score_sentiment(
+        pairs,
+        primary_hours=48,
+        fallback_hours=7*24,
+        print_headlines=0
     )
 
-    now_utc = datetime.now(timezone.utc).isoformat()
-    agg["LastUpdated"] = now_utc
-    if not arts.empty:
-        arts["IngestedAt"] = now_utc
+    # Stamp with update time for aggregates
+    now_iso = datetime.now(timezone.utc).isoformat()
+    aggregates_df = aggregates_df.copy()
+    aggregates_df["LastUpdated"] = now_iso
 
-    # write latest
-    agg.to_csv(out_dir / "latest_aggregates.csv", index=False)
-    arts.to_csv(out_dir / "latest_articles.csv", index=False)
-    # daily snapshot
-    agg.to_csv(snap_dir / "aggregates.csv", index=False)
-    arts.to_csv(snap_dir / "articles.csv", index=False)
+    # Stamp articles with ingest time
+    articles_df = articles_df.copy()
+    articles_df["IngestedAt"] = now_iso
 
-    print(f"Saved → {out_dir}/latest_aggregates.csv  | rows={len(agg)}")
-    print(f"Saved → {out_dir}/latest_articles.csv    | rows={len(arts)}")
-    print(f"Snapshot → {snap_dir}")
+    # Write outputs (index-scoped)
+    agg_uri = path_latest_aggregates()
+    day_uri = path_daily_articles()
+    print(f"[collector] Writing aggregates → {agg_uri} (rows={len(aggregates_df)})")
+    write_csv_gs(aggregates_df, agg_uri)
 
-# ---- Run for each index ----
-run_for(
-    BASE / "sp500" / "sp500_master.csv",
-    BASE / "sp500" / "news",
-    # limit=50,  # uncomment while testing
-)
+    print(f"[collector] Writing daily articles → {day_uri} (rows={len(articles_df)})")
+    write_csv_gs(articles_df, day_uri)
 
-run_for(
-    BASE / "ftse100" / "ftse100_master.csv",
-    BASE / "ftse100" / "news",
-    # limit=50,
-)
+    # Append into global meta parquet (dedupe on Ticker+title+published_at)
+    meta_uri = path_articles_parquet_meta()
+    existing = read_parquet_if_exists(meta_uri)
+    if existing is not None and not existing.empty:
+        merged = pd.concat([existing, articles_df], ignore_index=True)
+        merged = merged.drop_duplicates(subset=["Ticker","title","published_at"], keep="last")
+    else:
+        merged = articles_df
+    print(f"[collector] Updating meta parquet → {meta_uri} (rows={len(merged)})")
+    write_parquet_gs(merged, meta_uri)
 
-run_for(
-    BASE / "ftse250" / "ftse250_master.csv",
-    BASE / "ftse250" / "news",
-    # limit=50,
-)
+    print("[collector] Done.")
+
+if __name__ == "__main__":
+    run()
