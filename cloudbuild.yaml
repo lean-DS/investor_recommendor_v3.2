@@ -28,28 +28,21 @@ steps:
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: gcloud
     args:
-      [
-        "run",
-        "deploy",
-        "${_SERVICE}",
-        "--image",
-        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
-        "--region",
-        "${_REGION}",
-        "--platform",
-        "managed",
+       [
+        "run","deploy","${_SERVICE}",
+        "--image","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
+        "--region","${_REGION}",
+        "--platform","managed",
         "--allow-unauthenticated",
-        "--port",
-        "8080",
-        "--set-env-vars",
-        "GCS_DATA_BUCKET=fintech-inv-recomm-portfolio-data,GCS_BASE_PREFIX=portfolio_data",
-        "--memory",
-        "512Mi",
-        "--cpu",
-        "1",
-        "--concurrency",
-        "80",
+        "--port","8080",
+        "--memory","512Mi",
+        "--cpu","1",
+        "--concurrency","80",
+        "--min-instances","0",
+        "--max-instances","3"
       ]
 
 images:
   - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"
+options:
+  logging: CLOUD_LOGGING_ONLY   # ← satisfies the requirement
