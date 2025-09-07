@@ -7,40 +7,49 @@ Original file is located at
     https://colab.research.google.com/drive/1X0sa8MZ2lSik2uPFsYn0Irr-s24i1dJ_
 """
 
-# app.py
+# app.py — Cloud Run (reads from GCS)
+
 import os
 import time
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pathlib import Path
 
 # =========================
-# CONFIG: data base folder (Cloud Run / GCP)
+# CONFIG: point to your GCS bucket/prefix
 # =========================
-# Set DATA_BASE env var in Cloud Run to the folder that contains `portfolio_data`
-# Example: DATA_BASE=/workspace/portfolio_data
-BASE = Path(os.environ.get("DATA_BASE", "/workspace/portfolio_data"))
+BUCKET = os.environ.get("GCS_DATA_BUCKET", "fintech-inv-recomm-portfolio-data")
+BASE   = os.environ.get("GCS_BASE_PREFIX", "portfolio_data")
 
-# Equity features & prices
-SPX_FEATURES = BASE / "sp500/sp500_features_full.parquet"
-SPX_PRICES   = BASE / "sp500/sp500_prices.parquet"
+def gcs_path(*parts) -> str:
+    """Compose a gs:// path inside BUCKET/BASE."""
+    sub = "/".join(str(p).strip("/\\") for p in parts)
+    return f"gs://{BUCKET}/{BASE}/{sub}"
 
-FTSE100_FEATURES = BASE / "ftse100/ftse100_features_full.parquet"
-FTSE100_PRICES   = BASE / "ftse100/ftse100_prices.parquet"
-
-FTSE250_FEATURES = BASE / "ftse250/ftse250_features_full.parquet"
-FTSE250_PRICES   = BASE / "ftse250/ftse250_prices.parquet"
-
+# Equity features & prices (by index)
+FEATURE_PATHS = {
+    "sp500":  {
+        "features": gcs_path("sp500",  "sp500_features_full.parquet"),
+        "prices":   gcs_path("sp500",  "sp500_prices.parquet"),
+    },
+    "ftse100": {
+        "features": gcs_path("ftse100","ftse100_features_full.parquet"),
+        "prices":   gcs_path("ftse100","ftse100_prices.parquet"),
+    },
+    "ftse250": {
+        "features": gcs_path("ftse250","ftse250_features_full.parquet"),
+        "prices":   gcs_path("ftse250","ftse250_prices.parquet"),
+    },
+}
 # ETFs
-ETF_FEATURES = BASE / "etf/etf_features.parquet"
-ETF_PRICES   = BASE / "etf/etf_prices.parquet"
+ETF_FEATURES = gcs_path("etf", "etf_features.parquet")
+ETF_PRICES   = gcs_path("etf", "etf_prices.parquet")
 
-# Sentiment cache (FinBERT outputs saved by your sentiment job)
-SENT_CACHE   = BASE / "meta/sentiment_sample.parquet"
+# Sentiment cache
+SENT_CACHE   = gcs_path("meta", "sentiment_sample.parquet")
 
 # =========================
-# UI helpers
+# Helpers
 # =========================
 def zscore(s):
     s = pd.Series(s).astype(float)
@@ -54,10 +63,9 @@ def rotating_status(messages, delay=0.8):
         time.sleep(delay)
 
 def alpha_from_horizon(hz: str) -> float:
-    # Auto feature vs sentiment blend (no slider)
-    if hz == "< 3 years":       return 0.75
-    elif hz == "3–5 years":     return 0.85
-    else:                       return 0.90  # ≥ 5 years
+    if hz == "< 3 years":   return 0.75
+    elif hz == "3–5 years": return 0.85
+    else:                   return 0.90
 
 def friendly_cols(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {
@@ -71,38 +79,32 @@ def friendly_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
 def equity_target_share_from_age(age: int) -> float:
-    # Classic "100 - age" rule, clipped to [0.2, 0.9]
-    tgt = max(0.2, min(0.9, (100 - age) / 100.0))
-    return float(tgt)
+    return float(max(0.2, min(0.9, (100 - age) / 100.0)))
 
 # =========================
-# Loaders (standardize beta columns)
+# Loaders (read directly from gs://…)
 # =========================
-def _must_exist(p: Path, label: str):
-    if not p.exists():
-        st.error(f"Missing required data file: `{p}` for {label}. "
-                 f"Set env `DATA_BASE` to your portfolio_data folder.")
+def _read_parquet_or_fail(uri: str, label: str) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(uri)
+    except Exception as e:
+        st.error(
+            f"Missing or unreadable data file for **{label}**:\n"
+            f"`{uri}`\n\n"
+            f"Bucket: `{BUCKET}`, Base prefix: `{BASE}`.\n\n"
+            f"{e}"
+        )
         st.stop()
 
 @st.cache_data(show_spinner=False)
 def _load_equity_features(which: str) -> pd.DataFrame:
-    if which == "sp500":
-        p = SPX_FEATURES; _must_exist(p, "SP500 features")
-    elif which == "ftse100":
-        p = FTSE100_FEATURES; _must_exist(p, "FTSE100 features")
-    elif which == "ftse250":
-        p = FTSE250_FEATURES; _must_exist(p, "FTSE250 features")
-    else:
-        raise ValueError(f"unknown equity bucket: {which}")
-    df = pd.read_parquet(p).copy()
+    uri = FEATURE_PATHS[which]["features"]
+    df = _read_parquet_or_fail(uri, f"{which.upper()} features").copy()
     df.rename(columns={"Ticker": "ticker"}, inplace=True)
-    # Normalize expected columns
     for c in ["Mom_6M", "Mom_12M", "Vol_252d", "Dividend_Yield_TTM", "AvgVol_60d"]:
-        if c not in df.columns:
-            df[c] = np.nan
-    # STANDARDIZE BETA NAME: S&P used Beta_vs_SPY originally -> rename to Beta_vs_Benchmark
+        if c not in df.columns: df[c] = np.nan
     if "Beta_vs_Benchmark" not in df.columns and "Beta_vs_SPY" in df.columns:
-        df = df.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"})
+        df.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"}, inplace=True)
     if "Beta_vs_Benchmark" not in df.columns:
         df["Beta_vs_Benchmark"] = np.nan
     df["asset_type"] = "Equity"
@@ -110,78 +112,66 @@ def _load_equity_features(which: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def _load_equity_prices(which: str) -> pd.DataFrame:
-    if which == "sp500":
-        p = SPX_PRICES; _must_exist(p, "SP500 prices")
-    elif which == "ftse100":
-        p = FTSE100_PRICES; _must_exist(p, "FTSE100 prices")
-    elif which == "ftse250":
-        p = FTSE250_PRICES; _must_exist(p, "FTSE250 prices")
-    else:
-        raise ValueError(f"unknown equity price bucket: {which}")
-    px = pd.read_parquet(p).copy()
+    uri = FEATURE_PATHS[which]["prices"]
+    px = _read_parquet_or_fail(uri, f"{which.upper()} prices").copy()
     px["Date"] = pd.to_datetime(px["Date"])
-    return px[["Date", "Ticker", "Close"]]
+    return px[["Date","Ticker","Close"]]
 
 @st.cache_data(show_spinner=False)
 def load_universe(index_choice: str):
     if index_choice == "all":
-        eq = pd.concat([
-            _load_equity_features("sp500"),
-            _load_equity_features("ftse100"),
-            _load_equity_features("ftse250"),
-        ], ignore_index=True).drop_duplicates("ticker")
+        eq = pd.concat(
+            [_load_equity_features("sp500"),
+             _load_equity_features("ftse100"),
+             _load_equity_features("ftse250")],
+            ignore_index=True
+        ).drop_duplicates("ticker")
     else:
         eq = _load_equity_features(index_choice)
 
-    _must_exist(ETF_FEATURES, "ETF features")
-    etf = pd.read_parquet(ETF_FEATURES).copy()
+    etf = _read_parquet_or_fail(ETF_FEATURES, "ETF features").copy()
     etf.rename(columns={"Ticker": "ticker"}, inplace=True)
-    # Make sure ETFs expose the same expected columns
     for c in ["Mom_6M", "Mom_12M", "Vol_252d", "Dividend_Yield_TTM", "AvgVol_60d"]:
-        if c not in etf.columns:
-            etf[c] = np.nan
-    # Normalize beta name for ETFs (already Beta_vs_Benchmark in your files)
+        if c not in etf.columns: etf[c] = np.nan
     if "Beta_vs_Benchmark" not in etf.columns and "Beta_vs_SPY" in etf.columns:
-        etf = etf.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"})
+        etf.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"}, inplace=True)
     if "Beta_vs_Benchmark" not in etf.columns:
         etf["Beta_vs_Benchmark"] = np.nan
     etf["asset_type"] = "ETF"
     return eq, etf
 
 @st.cache_data(show_spinner=False)
-def load_prices(index_choice: str, include_etf: bool = True) -> pd.DataFrame:
+def load_prices(index_choice: str, include_etf: bool=True) -> pd.DataFrame:
     if index_choice == "all":
-        px_eq = pd.concat([
-            _load_equity_prices("sp500"),
-            _load_equity_prices("ftse100"),
-            _load_equity_prices("ftse250"),
-        ], ignore_index=True)
+        px_eq = pd.concat(
+            [_load_equity_prices("sp500"),
+             _load_equity_prices("ftse100"),
+             _load_equity_prices("ftse250")],
+            ignore_index=True
+        )
     else:
         px_eq = _load_equity_prices(index_choice)
 
     if include_etf:
-        _must_exist(ETF_PRICES, "ETF prices")
-        px_etf = pd.read_parquet(ETF_PRICES).copy()
+        px_etf = _read_parquet_or_fail(ETF_PRICES, "ETF prices").copy()
         px_etf["Date"] = pd.to_datetime(px_etf["Date"])
-        px_etf = px_etf[["Date", "Ticker", "Close"]]
-        px = pd.concat([px_eq, px_etf], ignore_index=True)
-    else:
-        px = px_eq
-
-    return px
+        px_etf = px_etf[["Date","Ticker","Close"]]
+        return pd.concat([px_eq, px_etf], ignore_index=True)
+    return px_eq
 
 @st.cache_data(show_spinner=False)
 def load_sentiment():
-    if SENT_CACHE.exists():
+    try:
         s = pd.read_parquet(SENT_CACHE).copy()
-        cand = [c for c in s.columns if "sentiment" in c.lower() or "score" in c.lower()]
-        score_col = cand[0] if cand else s.columns[-1]
-        s = s.rename(columns={score_col: "sentiment"})
-        s["ticker"] = s["ticker"].str.upper()
-        s = s.groupby("ticker", as_index=False)["sentiment"].mean()
-        s["sentiment_z"] = zscore(s["sentiment"])
-        return s[["ticker", "sentiment_z"]]
-    return pd.DataFrame(columns=["ticker", "sentiment_z"])
+    except Exception:
+        return pd.DataFrame(columns=["ticker","sentiment_z"])
+    cand = [c for c in s.columns if "sentiment" in c.lower() or "score" in c.lower()]
+    score_col = cand[0] if cand else s.columns[-1]
+    s = s.rename(columns={score_col: "sentiment"})
+    s["ticker"] = s["ticker"].str.upper()
+    s = s.groupby("ticker", as_index=False)["sentiment"].mean()
+    s["sentiment_z"] = zscore(s["sentiment"])
+    return s[["ticker","sentiment_z"]]
 
 # =========================
 # Scoring & filtering
@@ -189,97 +179,64 @@ def load_sentiment():
 def beta_band(risk):
     if risk == "Conservative": return (0.0, 0.8)
     if risk == "Moderate":     return (0.8, 1.4)
-    return (1.4, 3.0)  # Aggressive
+    return (1.4, 3.0)
 
 def build_feature_score(df, goal):
-    # Normalize
     mom = zscore(df["Mom_6M"]).fillna(0)*0.6 + zscore(df["Mom_12M"]).fillna(0)*0.4
     div = zscore(df["Dividend_Yield_TTM"]).fillna(0)
-    vol = -zscore(df["Vol_252d"]).fillna(0)  # lower vol = better
-
-    # Weights by goal
+    vol = -zscore(df["Vol_252d"]).fillna(0)
     if goal == "Capital Growth":
-        score = 0.60*mom + 0.30*vol + 0.10*div
+        return 0.60*mom + 0.30*vol + 0.10*div
     elif goal == "Dividend Income":
-        score = 0.50*div + 0.35*vol + 0.15*mom
-    else:  # Balanced
-        score = 0.45*mom + 0.35*vol + 0.20*div
-    return score
+        return 0.50*div + 0.35*vol + 0.15*mom
+    return 0.45*mom + 0.35*vol + 0.20*div
 
-def filter_candidates(eq, etf, risk, goal,
-                      top_equities=40, top_etfs=10):
+def filter_candidates(eq, etf, risk, goal, top_equities=40, top_etfs=10):
     lo, hi = beta_band(risk)
-    # Liquidity floor for stocks
-    eqc = eq.copy()
-    eqc = eqc[
-        (eqc["Beta_vs_Benchmark"].between(lo, hi, inclusive="both")) &
-        (eqc["AvgVol_60d"] > 200_000)
-    ]
+    eqc = eq[(eq["Beta_vs_Benchmark"].between(lo, hi, inclusive="both")) &
+             (eq["AvgVol_60d"].fillna(0) > 200_000)].copy()
     eqc["feature_score"] = build_feature_score(eqc, goal)
     eqc = eqc.sort_values("feature_score", ascending=False).head(top_equities)
 
-    etf_sel = etf.copy()
-    # Mild liquidity screen for ETFs
-    etf_sel = etf_sel[(etf_sel["AvgVol_60d"].fillna(0) > 50_000)]
+    etf_sel = etf[etf["AvgVol_60d"].fillna(0) > 50_000].copy()
     etf_sel["feature_score"] = build_feature_score(etf_sel, goal)
     etf_sel = etf_sel.sort_values("feature_score", ascending=False).head(top_etfs)
-
     return eqc, etf_sel
 
 def blend_with_sentiment(df, sent, alpha: float):
     out = df.merge(sent, how="left", on="ticker")
     out["sentiment_z"] = out["sentiment_z"].fillna(0.0)
-    # z-score the feature score too (scale parity)
     out["feature_z"] = zscore(out["feature_score"])
     out["final_score"] = alpha*out["feature_z"] + (1-alpha)*out["sentiment_z"]
     return out.sort_values("final_score", ascending=False)
 
 # =========================
-# Simple MPT (max Sharpe, long-only, cap per name)
+# Simple MPT (max Sharpe, long-only)
 # =========================
 def max_sharpe_longonly(returns_df, rf=0.015, max_w=0.10, n_iter=6000, seed=42):
     rng = np.random.default_rng(seed)
     X = returns_df.fillna(0).to_numpy()
-    mu = X.mean(axis=0) * 252.0  # annualized mean
+    mu = X.mean(axis=0) * 252.0
     cov = np.cov(X, rowvar=False) * 252.0
-
-    def portfolio_stats(w):
-        ret = float(w @ mu)
-        vol = float(np.sqrt(max(w @ cov @ w, 1e-12)))
-        sharpe = (ret - rf) / (vol + 1e-9)
-        return ret, vol, sharpe
 
     best = (None, -1e9)
     n = X.shape[1]
     for _ in range(n_iter):
-        w = rng.random(n)
-        w = w / w.sum()
-        # cap
+        w = rng.random(n); w = w / w.sum()
         if (w > max_w).any():
-            over = (w - max_w).clip(min=0)
-            w -= over
-            w = w / w.sum()
-        _, _, sh = portfolio_stats(w)
-        if sh > best[1]:
-            best = (w, sh)
+            over = (w - max_w).clip(min=0); w -= over; w = w / w.sum()
+        vol = float(np.sqrt(max(w @ cov @ w, 1e-12)))
+        sh  = (float(w @ mu) - rf) / (vol + 1e-9)
+        if sh > best[1]: best = (w, sh)
     return best[0], mu, cov
 
 def rescale_group_weights(weights: pd.Series, group: pd.Series, target_share: float) -> pd.Series:
-    """Rescale weights so sum(Equity)=target_share and sum(ETF)=1-target_share."""
     w = weights.copy()
-    is_equity = (group == "Equity")
-    is_etf    = (group == "ETF")
-
-    w_e = w[is_equity].sum()
-    w_b = w[is_etf].sum()
-    # avoid division by zero
-    if w_e > 1e-9:
-        w.loc[is_equity] = w.loc[is_equity] * (target_share / w_e)
-    if w_b > 1e-9:
-        w.loc[is_etf]    = w.loc[is_etf]    * ((1.0 - target_share) / w_b)
-    # small numerical fix
-    w = w / w.sum()
-    return w
+    is_equity = (group == "Equity"); is_etf = (group == "ETF")
+    w_e = w[is_equity].sum(); w_b = w[is_etf].sum()
+    if w_e > 1e-9: w.loc[is_equity] *= (target_share / w_e)
+    if w_b > 1e-9: w.loc[is_etf]    *= ((1.0 - target_share) / w_b)
+    return w / w.sum()
 
 # =========================
 # UI
@@ -309,90 +266,57 @@ if st.button("Build my portfolio"):
     rot = rotating_status(msgs, delay=0.9)
 
     spinner.info(next(rot))
-
-    # Map UI choice to loaders
-    idx_map = {
-        "SP500": "sp500", "FTSE100": "ftse100", "FTSE250": "ftse250", "All": "all"
-    }
-    idx = idx_map[index_choice]
-
-    eq, etf = load_universe(idx)
-    sent = load_sentiment()
-    px = load_prices(idx, include_etf=include_etf)
+    idx = {"SP500": "sp500", "FTSE100": "ftse100", "FTSE250": "ftse250", "All": "all"}[index_choice]
+    eq, etf = load_universe(idx); sent = load_sentiment(); px = load_prices(idx, include_etf=include_etf)
 
     spinner.info(next(rot))
-    # Candidates
-    eq_40, etf_10 = filter_candidates(eq, etf, risk, goal, top_equities=40, top_etfs=10 if include_etf else 0)
+    eq_40, etf_10 = filter_candidates(eq, etf, risk, goal, top_equities=40, top_etfs=(10 if include_etf else 0))
 
     spinner.info(next(rot))
-    # Blend with sentiment (auto alpha from horizon)
     alpha = alpha_from_horizon(horizon)
     cand = pd.concat([eq_40, etf_10], ignore_index=True)
     blended = blend_with_sentiment(cand, sent, alpha=alpha)
 
-    # Align prices → returns matrix for selected tickers
     spinner.info(next(rot))
     use_tickers = blended["ticker"].tolist()
-    mat = (px
-           .query("Ticker in @use_tickers")[["Date","Ticker","Close"]]
-           .pivot(index="Date", columns="Ticker", values="Close")
-           .sort_index()
-           .pct_change()
-           .dropna(how="all"))
-    # Drop columns with too few points
+    mat = (px.query("Ticker in @use_tickers")[["Date","Ticker","Close"]]
+             .pivot(index="Date", columns="Ticker", values="Close")
+             .sort_index().pct_change().dropna(how="all"))
     mat = mat.dropna(axis=1, thresh=int(0.6*len(mat)))
     keep = [t for t in blended["ticker"] if t in mat.columns]
     blended = blended[blended["ticker"].isin(keep)].reset_index(drop=True)
     mat = mat[keep]
 
-    # Optimize (MPT) with per-name cap=10%
     spinner.info("Optimizing weights (MPT)…")
     if mat.shape[1] < 5:
-        st.warning("Too few instruments after filtering/price alignment.")
-        st.stop()
-
+        st.warning("Too few instruments after filtering/price alignment."); st.stop()
     w0, mu, cov = max_sharpe_longonly(mat, rf=0.015, max_w=0.10, n_iter=6000, seed=42)
 
-    # Enforce Equity vs ETF split via age rule (100-age)
     target_equity_share = equity_target_share_from_age(age)
     w_series = pd.Series(w0, index=mat.columns)
-    # Merge asset types
     types = blended.set_index("ticker")["asset_type"].reindex(mat.columns).fillna("Equity")
     w_adj = rescale_group_weights(w_series, types, target_share=target_equity_share)
 
-    # Final result
     res = blended.set_index("ticker").loc[mat.columns].reset_index()
     res["weight"] = w_adj.values
     res["alloc_$"] = (res["weight"] * amount).round(2)
-
-    # Portfolio beta (weighted average of Beta_vs_Benchmark)
     res["Beta_contrib"] = res["weight"] * res["Beta_vs_Benchmark"].fillna(1.0)
     port_beta = float(res["Beta_contrib"].sum())
 
     spinner.success("Portfolio ready!")
-
-    # Display summary
     eq_n = int((res["asset_type"] == "Equity").sum())
     etf_n = int((res["asset_type"] == "ETF").sum())
     st.subheader(f"Summary: {eq_n} Equities, {etf_n} ETFs · Target Equity Share ≈ {target_equity_share:.0%} · Portfolio Beta ≈ {port_beta:.2f}")
 
-    # Show table
-    show_cols = [
-        "ticker", "asset_type", "weight", "alloc_$",
-        "Beta_vs_Benchmark", "Mom_6M", "Mom_12M",
-        "Dividend_Yield_TTM", "sentiment_z", "final_score"
-    ]
+    show_cols = ["ticker","asset_type","weight","alloc_$","Beta_vs_Benchmark","Mom_6M","Mom_12M","Dividend_Yield_TTM","sentiment_z","final_score"]
     present = [c for c in show_cols if c in res.columns]
     pretty = friendly_cols(res[present])
     st.dataframe(
         pretty.style.format({
-            "weight": "{:.2%}", "alloc_$": "${:,.0f}",
-            "Beta": "{:.2f}",
-            "6M Return": "{:.2%}", "12M Return": "{:.2%}",
-            "Dividend Yield": "{:.2%}", "Sentiment": "{:.2f}",
-            "Score": "{:.2f}",
+            "weight":"{:.2%}","alloc_$":"${:,.0f}","Beta":"{:.2f}",
+            "6M Return":"{:.2%}","12M Return":"{:.2%}",
+            "Dividend Yield":"{:.2%}","Sentiment":"{:.2f}","Score":"{:.2f}",
         }),
         use_container_width=True
     )
-
-    st.caption("Notes: long-only; per-name cap 10%; equity/ETF split uses (100 − age) rule; β is Beta_vs_Benchmark from your feature files.")
+    st.caption("Notes: long-only; per-name cap 10%; equity/ETF split uses (100 − age) rule; β shown is Beta_vs_Benchmark from your feature tables.")
