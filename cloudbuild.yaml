@@ -1,11 +1,55 @@
-steps:
-  # Step 1: Build the Docker image
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'europe-west1-docker.pkg.dev/fintech-inv-recomm/portfolio-repo/portfolio-app:latest', '.']
+substitutions:
+  _REGION: "europe-west1"
+  _REPO: "portfolio-repo"
+  _IMAGE: "portfolio-app"
+  _SERVICE: "portfolio"
+  _PROJECT: "fintech-inv-recomm"
 
-  # Step 2: Push the image to Artifact Registry
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'europe-west1-docker.pkg.dev/fintech-inv-recomm/portfolio-repo/portfolio-app:latest']
+steps:
+  # Build the Docker image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "build",
+        "-t",
+        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
+        ".",
+      ]
+
+  # Push the image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "push",
+        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
+      ]
+
+  # Deploy to Cloud Run
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      [
+        "run",
+        "deploy",
+        "${_SERVICE}",
+        "--image",
+        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
+        "--region",
+        "${_REGION}",
+        "--platform",
+        "managed",
+        "--allow-unauthenticated",
+        "--port",
+        "8080",
+        "--set-env-vars",
+        "GCS_DATA_BUCKET=fintech-inv-recomm-portfolio-data,GCS_BASE_PREFIX=portfolio_data",
+        "--memory",
+        "512Mi",
+        "--cpu",
+        "1",
+        "--concurrency",
+        "80",
+      ]
 
 images:
-  - 'europe-west1-docker.pkg.dev/fintech-inv-recomm/portfolio-repo/portfolio-app:latest'
+  - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"
