@@ -1,37 +1,37 @@
-# Core
+# --- Core ---
 pandas==2.2.2
 numpy==1.26.4
 scipy==1.13.1
 scikit-learn==1.5.1
+joblib==1.4.2
+pyarrow==17.0.0
 
-# Visualization
+# --- Visualization ---
 matplotlib==3.9.2
 seaborn==0.13.2
 plotly==5.23.0
 
-# Data sources
+# --- Data sources ---
 yfinance==0.2.40
 pandas-datareader==0.10.0
 
-# Time series models
+# --- Time series models ---
 statsmodels==0.14.2
 pmdarima==2.0.4
 prophet==1.1.5
 tensorflow==2.17.0
 keras==3.4.1
 
-# NLP + Sentiment
+# --- NLP + Sentiment ---
 transformers==4.44.2
 torch==2.4.1
 nltk==3.9.1
 
-# Web app
+# --- Web app / GCP ---
 streamlit==1.38.0
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
 gcsfs==2024.9.0
 
-# Utilities
+# --- Utilities ---
 tqdm==4.66.5
-joblib==1.4.2
-pyarrow==17.0.0
