@@ -307,17 +307,17 @@ with st.sidebar:
     st.caption(f"Recommended from age: **{recommended}**")
 
     st.divider()
-st.caption("User (temporary until auth)")
-uid   = st.text_input("User ID", value="demo-user-1")
-email = st.text_input("Email (optional)", value="demo@example.com")
+    st.caption("User (temporary until auth)")
+    uid   = st.text_input("User ID", value="demo-user-1")
+    email = st.text_input("Email (optional)", value="demo@example.com")
 
-if uid:
-    try:
-        db.upsert_user(uid, email or None)  # pass (uid, email)
-        st.session_state["uid_sidebar"] = uid
-        st.caption("User ready in Database")
-    except Exception as e:
-        st.error(f"DB user upsert failed: {e}")
+    if uid:
+        try:
+            db.upsert_user(uid, email or None)  # pass (uid, email)
+            st.session_state["uid_sidebar"] = uid
+            st.caption("User ready in Database")
+        except Exception as e:
+            st.error(f"DB user upsert failed: {e}")
         
 if st.button("Build my portfolio"):
     spinner = st.empty()
