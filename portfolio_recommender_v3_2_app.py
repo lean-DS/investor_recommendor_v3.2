@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
-st.title("Personalized Portfolio Builder")
+st.title("Personalized Portfolio Builder v3.2")
 
 # ============== GCS CONFIG ==============
 BUCKET = os.environ.get("GCS_DATA_BUCKET", "fintech-inv-recomm-portfolio-data")
@@ -48,18 +48,17 @@ def alpha_from_horizon(hz: str) -> float:
     return 0.90  # ≥ 5 years
 
 def equity_target_share_from_age(age: int) -> float:
-    # Classic (100 - age), clipped
     return float(max(0.2, min(0.9, (100 - age) / 100.0)))
 
-def risk_from_age(age: int) -> str:
+def risk_recommendation_from_age(age: int) -> str:
     if age < 30:        return "Aggressive"
     if 30 <= age <= 45: return "Moderate"
     return "Conservative"
 
 def friendly_cols(df: pd.DataFrame) -> pd.DataFrame:
-    # IMPORTANT: show 'ticker' as 'Securities'
+    # CHANGE: show 'Ticker' to the user as 'Securities'
     rename_map = {
-        "ticker": "Securities",
+        "Ticker": "Securities",
         "asset_type": "Asset",
         "weight": "Weight",
         "alloc_$": "Alloc $",
@@ -86,6 +85,7 @@ def _read_parquet(uri: str, label: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def _load_equity_features(which: str) -> pd.DataFrame:
+    # CHANGE: keep 'Ticker' as-is; do NOT rename to 'ticker'
     if which == "sp500":
         df = _read_parquet(SPX_FEATURES, "SP500 features")
     elif which == "ftse100":
@@ -96,17 +96,16 @@ def _load_equity_features(which: str) -> pd.DataFrame:
         raise ValueError(f"unknown equity bucket: {which}")
 
     df = df.copy()
-    # Use Ticker from the features parquet ONLY; standardize to 'ticker'
+    # Uppercase Ticker to be safe
     if "Ticker" in df.columns:
-        df.rename(columns={"Ticker": "ticker"}, inplace=True)
-    df["ticker"] = df["ticker"].astype(str).str.upper()
+        df["Ticker"] = df["Ticker"].astype(str).str.upper()
 
     # ensure expected cols exist
     for c in ["Mom_6M", "Mom_12M", "Vol_252d", "Dividend_Yield_TTM", "AvgVol_60d"]:
         if c not in df.columns:
             df[c] = np.nan
 
-    # unify beta column name
+    # unify beta column name (to Beta_vs_Benchmark)
     if "Beta_vs_Benchmark" not in df.columns:
         if "Beta_vs_SPY" in df.columns:
             df.rename(columns={"Beta_vs_SPY": "Beta_vs_Benchmark"}, inplace=True)
@@ -133,6 +132,7 @@ def _load_equity_prices(which: str) -> pd.DataFrame:
 
     px = px.copy()
     px["Date"] = pd.to_datetime(px["Date"])
+    # keep Ticker casing as in files
     return px[["Date", "Ticker", "Close"]]
 
 @st.cache_data(show_spinner=False)
@@ -142,14 +142,13 @@ def load_universe(index_choice: str):
             _load_equity_features("sp500"),
             _load_equity_features("ftse100"),
             _load_equity_features("ftse250"),
-        ], ignore_index=True).drop_duplicates("ticker")
+        ], ignore_index=True).drop_duplicates("Ticker")
     else:
         eq = _load_equity_features(index_choice)
 
     etf = _read_parquet(ETF_FEATURES, "ETF features").copy()
     if "Ticker" in etf.columns:
-        etf.rename(columns={"Ticker": "ticker"}, inplace=True)
-    etf["ticker"] = etf["ticker"].astype(str).str.upper()
+        etf["Ticker"] = etf["Ticker"].astype(str).str.upper()
 
     # ensure expected cols exist
     for c in ["Mom_6M", "Mom_12M", "Vol_252d", "Dividend_Yield_TTM", "AvgVol_60d"]:
@@ -187,23 +186,22 @@ def load_prices(index_choice: str, include_etf: bool = True) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_sentiment():
+    # CHANGE: normalize to 'Ticker' (uppercase), not 'ticker'
     s = _read_parquet(SENT_CACHE, "Sentiment cache (FinBERT)").copy()
     cols = {c.lower(): c for c in s.columns}
 
-    # find ticker
     tick_col = cols.get("ticker", "Ticker" if "Ticker" in s.columns else s.columns[0])
-    # find sentiment/score
     if "sentiment" in cols:
         val_col = cols["sentiment"]
     else:
         cand = [c for c in s.columns if "sentiment" in c.lower() or "score" in c.lower()]
         val_col = cand[0] if cand else (s.columns[1] if len(s.columns) > 1 else s.columns[0])
 
-    s = s.rename(columns={tick_col: "ticker", val_col: "sentiment"})
-    s["ticker"] = s["ticker"].astype(str).str.upper()
-    s = s.groupby("ticker", as_index=False)["sentiment"].mean()
+    s = s.rename(columns={tick_col: "Ticker", val_col: "sentiment"})
+    s["Ticker"] = s["Ticker"].astype(str).str.upper()
+    s = s.groupby("Ticker", as_index=False)["sentiment"].mean()
     s["sentiment_z"] = zscore(s["sentiment"])
-    return s[["ticker", "sentiment_z"]]
+    return s[["Ticker", "sentiment_z"]]
 
 # ============== Scoring & filtering ==============
 def beta_band(risk):
@@ -238,7 +236,8 @@ def filter_candidates(eq, etf, risk, goal, top_equities=40, top_etfs=10):
     return eqc, etf_sel
 
 def blend_with_sentiment(df, sent, alpha: float):
-    out = df.merge(sent, how="left", on="ticker")
+    # CHANGE: merge on 'Ticker'
+    out = df.merge(sent, how="left", on="Ticker")
     out["sentiment_z"] = out["sentiment_z"].fillna(0.0)
     out["feature_z"] = zscore(out["feature_score"])
     out["final_score"] = alpha*out["feature_z"] + (1-alpha)*out["sentiment_z"]
@@ -284,9 +283,15 @@ with st.sidebar:
     goal = st.selectbox("Primary Goal", ["Capital Growth", "Dividend Income", "Balanced"], index=0)
     amount = st.number_input("Investment Amount (USD)", min_value=1000.0, value=10000.0, step=500.0)
 
-    # Risk is auto-chosen from age
-    risk_auto = risk_from_age(age)
-    st.caption(f"Risk profile set from age: **{risk_auto}** (auto)")
+    # CHANGE: Recommend risk but let user choose (default = recommendation)
+    recommended = risk_recommendation_from_age(age)
+    risk = st.selectbox(
+        "Risk Appetite",
+        ["Conservative", "Moderate", "Aggressive"],
+        index=["Conservative", "Moderate", "Aggressive"].index(recommended),
+        help="Default set from age; feel free to adjust."
+    )
+    st.caption(f"Recommended from age: **{recommended}**")
 
 if st.button("Build my portfolio"):
     spinner = st.empty()
@@ -303,26 +308,25 @@ if st.button("Build my portfolio"):
 
     eq, etf = load_universe(idx); spinner.info(next(rot))
     sent = load_sentiment();      spinner.info(next(rot))
-    # ETFs are always included now
-    px = load_prices(idx, include_etf=True)
+    px = load_prices(idx, include_etf=True)  # ETFs always included
 
     # candidates
-    eq_40, etf_10 = filter_candidates(eq, etf, risk_auto, goal, top_equities=40, top_etfs=10)
+    eq_40, etf_10 = filter_candidates(eq, etf, risk, goal, top_equities=40, top_etfs=10)
 
     alpha = alpha_from_horizon(horizon)
     cand = pd.concat([eq_40, etf_10], ignore_index=True)
     blended = blend_with_sentiment(cand, sent, alpha=alpha)
 
     spinner.info(next(rot))
-    use_tickers = blended["ticker"].tolist()
+    use_tickers = blended["Ticker"].tolist()
     mat = (px.query("Ticker in @use_tickers")[["Date","Ticker","Close"]]
            .pivot(index="Date", columns="Ticker", values="Close")
            .sort_index()
            .pct_change(fill_method=None)
            .dropna(how="all"))
     mat = mat.dropna(axis=1, thresh=int(0.6*len(mat)))
-    keep = [t for t in blended["ticker"] if t in mat.columns]
-    blended = blended[blended["ticker"].isin(keep)].reset_index(drop=True)
+    keep = [t for t in blended["Ticker"] if t in mat.columns]
+    blended = blended[blended["Ticker"].isin(keep)].reset_index(drop=True)
     mat = mat[keep]
 
     spinner.info("Optimizing weights (MPT)…")
@@ -333,10 +337,10 @@ if st.button("Build my portfolio"):
 
     target_equity_share = equity_target_share_from_age(age)
     w_series = pd.Series(w0, index=mat.columns)
-    types = blended.set_index("ticker")["asset_type"].reindex(mat.columns).fillna("Equity")
+    types = blended.set_index("Ticker")["asset_type"].reindex(mat.columns).fillna("Equity")
     w_adj = rescale_group_weights(w_series, types, target_share=target_equity_share)
 
-    res = blended.set_index("ticker").loc[mat.columns].reset_index()
+    res = blended.set_index("Ticker").loc[mat.columns].reset_index()
     res["weight"] = w_adj.values
     res["alloc_$"] = (res["weight"] * amount).round(2)
 
@@ -353,9 +357,9 @@ if st.button("Build my portfolio"):
         f"Target Equity Share ≈ {target_equity_share:.0%} · Portfolio Beta ≈ {port_beta:.2f}"
     )
 
-    # Display (use 'Securities' column label for tickers)
+    # Display (use 'Securities' label for the Ticker column)
     show_cols = [
-        "ticker", "asset_type", "weight", "alloc_$",
+        "Ticker", "asset_type", "weight", "alloc_$",
         "Beta_vs_Benchmark", "Mom_6M", "Mom_12M",
         "Dividend_Yield_TTM", "sentiment_z", "final_score"
     ]
