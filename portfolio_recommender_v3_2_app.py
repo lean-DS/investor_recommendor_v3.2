@@ -376,6 +376,36 @@ if st.button("Build my portfolio"):
         }),
         use_container_width=True
     )
+# ---- Save portfolio to DB ----
+with st.container():
+    st.subheader("Save portfolio")
+    default_name = f"{index_choice} • {risk_auto} • {pd.Timestamp.utcnow().date().isoformat()}"
+    pf_name = st.text_input("Portfolio name", value=default_name)
+    if st.button("💾 Save to database", use_container_width=True, type="primary", disabled=not uid):
+        try:
+            meta = {
+                "index_choice": idx.upper(),
+                "risk_profile": risk_auto,
+                "horizon": horizon,
+                "amount_usd": float(amount),
+                "name": pf_name,
+            }
+            portfolio_id = db.save_portfolio(uid, meta, res)
+            st.success(f"Saved! Portfolio ID: {portfolio_id}")
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+# ---- List my saved portfolios ----
+st.subheader("My portfolios")
+try:
+    if uid:
+        pf = db.list_user_portfolios(uid)
+        if pf.empty:
+            st.info("No saved portfolios yet.")
+        else:
+            st.dataframe(pf, use_container_width=True)
+except Exception as e:
+    st.error(f"List failed: {e}")
 
     st.caption(
         "Notes: long-only; per-name cap 10%; equity/ETF split uses (100 − age) rule; "
