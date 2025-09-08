@@ -1,36 +1,73 @@
 # auth.py
-import os, json
-import streamlit as st
-import firebase_admin
-from firebase_admin import auth as fb_auth, credentials
+import os, time, json, requests, streamlit as st
+from urllib.parse import urlencode
 
-# One-time Firebase Admin init from env var FIREBASE_CREDS (service account JSON)
-if not firebase_admin._apps:
-    _creds_json = os.environ.get("FIREBASE_CREDS")
-    if not _creds_json:
-        raise RuntimeError("FIREBASE_CREDS env var not set. Provide your Firebase service account JSON.")
-    cred = credentials.Certificate(json.loads(_creds_json))
-    firebase_admin.initialize_app(cred)
+AUTH_BASE = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+USERINFO  = "https://openidconnect.googleapis.com/v1/userinfo"
+SCOPES = ["openid","email","profile"]
 
-@st.cache_resource(show_spinner=False)
-def verify_id_token(id_token: str):
-    """Verify Firebase ID token and return decoded claims or None."""
+CLIENT_ID     = os.environ["GOOGLE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
+REDIRECT_URI  = os.environ["OAUTH_REDIRECT_URI"]
+
+def login_button(label="Sign in with Google"):
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+    }
+    st.link_button(label, f"{AUTH_BASE}?{urlencode(params)}", use_container_width=True)
+
+def _exchange_code_for_tokens(code: str):
+    data = {
+        "code": code,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }
+    r = requests.post(TOKEN_URL, data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def _fetch_userinfo(access_token: str):
+    r = requests.get(USERINFO, headers={"Authorization": f"Bearer {access_token}"}, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def handle_oauth_callback():
+    # Call this at the top of app.py to capture ?code=...
+    q = st.experimental_get_query_params()
+    code = q.get("code", [None])[0]
+    if not code:
+        return
     try:
-        return fb_auth.verify_id_token(id_token, clock_skew_seconds=60)
-    except Exception:
-        return None
+        tokens = _exchange_code_for_tokens(code)
+        info = _fetch_userinfo(tokens["access_token"])
+        # Minimal session payload
+        st.session_state["user"] = {
+            "uid": info.get("sub"),
+            "email": info.get("email"),
+            "name": info.get("name"),
+            "picture": info.get("picture"),
+            "ts": int(time.time()),
+            "tokens": {"access_token": tokens.get("access_token")}
+        }
+        # Clean URL (remove ?code=...)
+        st.experimental_set_query_params()
+        st.success(f"Signed in as {info.get('email')}")
+    except Exception as e:
+        st.error(f"Google sign-in failed: {e}")
 
-def sidebar_login() -> dict | None:
-    """
-    Minimal sign-in UX for now: paste ID token (replace with Firebase Web SDK later).
-    Returns decoded user dict or None.
-    """
-    with st.sidebar:
-        st.markdown("### Sign in")
-        token = st.text_input("Paste Firebase ID token", type="password")
-        user = verify_id_token(token) if token else None
-        if user:
-            st.success(f"Signed in as {user.get('email','user')}")
-        else:
-            st.info("Not signed in")
-        return user
+def get_current_user():
+    return st.session_state.get("user")
+
+def logout_button():
+    if st.button("Sign out"):
+        st.session_state.pop("user", None)
+        st.experimental_set_query_params()
