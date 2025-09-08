@@ -42,3 +42,4 @@ streamlit-auth0
 
 # --- Utilities ---
 tqdm==4.66.5
+requests>=2.32
