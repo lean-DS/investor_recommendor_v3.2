@@ -314,7 +314,7 @@ with st.sidebar:
     try:
         db.upsert_user(uid, email or None)   # <-- was dict; now (uid, email)
         st.session_state["uid_sidebar"] = uid
-        st.caption("User ready in DB ✅")
+        st.caption("User ready in Database")
     except Exception as e:
         st.error(f"DB user upsert failed: {e}")
         
