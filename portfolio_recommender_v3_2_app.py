@@ -8,12 +8,18 @@ import streamlit as st
 st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
 st.title("Personalized Portfolio Builder v3.2")
 
+# ===== DB init =====
 import db  # your db.py
 
 @st.cache_resource
 def _init_db():
     db.ensure_schema()
-    db.enable_rls()
+    # Call enable_rls() only if you actually implemented it.
+    if hasattr(db, "enable_rls"):
+        try:
+            db.enable_rls()
+        except Exception:
+            pass
     return True
 
 DB_READY = _init_db()
@@ -66,7 +72,7 @@ def risk_recommendation_from_age(age: int) -> str:
     return "Conservative"
 
 def friendly_cols(df: pd.DataFrame) -> pd.DataFrame:
-    # CHANGE: show 'Ticker' to the user as 'Securities'
+    # Show 'Ticker' to the user as 'Securities'
     rename_map = {
         "Ticker": "Securities",
         "asset_type": "Asset",
@@ -95,7 +101,7 @@ def _read_parquet(uri: str, label: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def _load_equity_features(which: str) -> pd.DataFrame:
-    # CHANGE: keep 'Ticker' as-is; do NOT rename to 'ticker'
+    # Keep 'Ticker' as-is; do NOT rename to 'ticker'
     if which == "sp500":
         df = _read_parquet(SPX_FEATURES, "SP500 features")
     elif which == "ftse100":
@@ -106,7 +112,6 @@ def _load_equity_features(which: str) -> pd.DataFrame:
         raise ValueError(f"unknown equity bucket: {which}")
 
     df = df.copy()
-    # Uppercase Ticker to be safe
     if "Ticker" in df.columns:
         df["Ticker"] = df["Ticker"].astype(str).str.upper()
 
@@ -142,7 +147,6 @@ def _load_equity_prices(which: str) -> pd.DataFrame:
 
     px = px.copy()
     px["Date"] = pd.to_datetime(px["Date"])
-    # keep Ticker casing as in files
     return px[["Date", "Ticker", "Close"]]
 
 @st.cache_data(show_spinner=False)
@@ -196,7 +200,7 @@ def load_prices(index_choice: str, include_etf: bool = True) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_sentiment():
-    # CHANGE: normalize to 'Ticker' (uppercase), not 'ticker'
+    # Normalize to 'Ticker' (uppercase)
     s = _read_parquet(SENT_CACHE, "Sentiment cache (FinBERT)").copy()
     cols = {c.lower(): c for c in s.columns}
 
@@ -246,7 +250,6 @@ def filter_candidates(eq, etf, risk, goal, top_equities=40, top_etfs=10):
     return eqc, etf_sel
 
 def blend_with_sentiment(df, sent, alpha: float):
-    # CHANGE: merge on 'Ticker'
     out = df.merge(sent, how="left", on="Ticker")
     out["sentiment_z"] = out["sentiment_z"].fillna(0.0)
     out["feature_z"] = zscore(out["feature_score"])
@@ -293,7 +296,7 @@ with st.sidebar:
     goal = st.selectbox("Primary Goal", ["Capital Growth", "Dividend Income", "Balanced"], index=0)
     amount = st.number_input("Investment Amount (USD)", min_value=1000.0, value=10000.0, step=500.0)
 
-    # CHANGE: Recommend risk but let user choose (default = recommendation)
+    # Recommend risk but let user choose (default = recommendation)
     recommended = risk_recommendation_from_age(age)
     risk = st.selectbox(
         "Risk Appetite",
@@ -302,6 +305,18 @@ with st.sidebar:
         help="Default set from age; feel free to adjust."
     )
     st.caption(f"Recommended from age: **{recommended}**")
+
+    st.divider()
+    st.caption("User (temporary until auth)")
+    uid   = st.text_input("User ID", value="demo-user-1")
+    email = st.text_input("Email (optional)", value="demo@example.com")
+    if uid:
+        try:
+            # adjust signature to your db.upsert_user; here we pass a dict
+            db.upsert_user({"uid": uid, "email": email or None})
+            st.caption("User ready in DB ✅")
+        except Exception as e:
+            st.error(f"DB user upsert failed: {e}")
 
 if st.button("Build my portfolio"):
     spinner = st.empty()
@@ -386,30 +401,52 @@ if st.button("Build my portfolio"):
         }),
         use_container_width=True
     )
+
+    # Persist the latest build to session for the Save section
+    st.session_state["last_res"] = res
+    st.session_state["last_meta"] = {
+        "index_choice": idx.upper(),
+        "risk_profile": risk,        # user-chosen risk
+        "horizon": horizon,
+        "amount_usd": float(amount),
+    }
+
 # ---- Save portfolio to DB ----
-with st.container():
-    st.subheader("Save portfolio")
-    default_name = f"{index_choice} • {risk_auto} • {pd.Timestamp.utcnow().date().isoformat()}"
+st.subheader("Save portfolio")
+if "last_res" in st.session_state and "last_meta" in st.session_state:
+    default_name = f'{st.session_state["last_meta"]["index_choice"]} • {st.session_state["last_meta"]["risk_profile"]} • {pd.Timestamp.utcnow().date().isoformat()}'
     pf_name = st.text_input("Portfolio name", value=default_name)
-    if st.button("💾 Save to database", use_container_width=True, type="primary", disabled=not uid):
+
+    can_save = True
+    # need uid from sidebar scope; re-read safely:
+    uid_for_save = st.session_state.get("uid_sidebar") if "uid_sidebar" in st.session_state else None
+    # fallback: use the current input if present
+    try:
+        uid_for_save = uid_for_save or uid
+    except NameError:
+        uid_for_save = None
+
+    if st.button("💾 Save to database", use_container_width=True, type="primary", disabled=not bool(uid_for_save)):
         try:
-            meta = {
-                "index_choice": idx.upper(),
-                "risk_profile": risk_auto,
-                "horizon": horizon,
-                "amount_usd": float(amount),
-                "name": pf_name,
-            }
-            portfolio_id = db.save_portfolio(uid, meta, res)
+            meta = dict(st.session_state["last_meta"])
+            meta["name"] = pf_name
+            portfolio_id = db.save_portfolio(uid_for_save, meta, st.session_state["last_res"])
             st.success(f"Saved! Portfolio ID: {portfolio_id}")
         except Exception as e:
             st.error(f"Save failed: {e}")
+else:
+    st.info("Build a portfolio first to enable saving.")
 
 # ---- List my saved portfolios ----
 st.subheader("My portfolios")
 try:
-    if uid:
-        pf = db.list_user_portfolios(uid)
+    uid_list = None
+    try:
+        uid_list = uid
+    except NameError:
+        uid_list = None
+    if uid_list:
+        pf = db.list_user_portfolios(uid_list)
         if pf.empty:
             st.info("No saved portfolios yet.")
         else:
@@ -417,7 +454,7 @@ try:
 except Exception as e:
     st.error(f"List failed: {e}")
 
-    st.caption(
-        "Notes: long-only; per-name cap 10%; equity/ETF split uses (100 − age) rule; "
-        "β is Beta_vs_Benchmark from your feature files. Data is loaded from GCS."
-    )
+st.caption(
+    "Notes: long-only; per-name cap 10%; equity/ETF split uses (100 − age) rule; "
+    "β is Beta_vs_Benchmark from your feature files. Data is loaded from GCS."
+)
