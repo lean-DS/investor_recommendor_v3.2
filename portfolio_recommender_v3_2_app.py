@@ -311,13 +311,13 @@ with st.sidebar:
     uid   = st.text_input("User ID", value="demo-user-1")
     email = st.text_input("Email (optional)", value="demo@example.com")
     if uid:
-        try:
-            # adjust signature to your db.upsert_user; here we pass a dict
-            db.upsert_user({"uid": uid, "email": email or None})
-            st.caption("User ready in DB ✅")
-        except Exception as e:
-            st.error(f"DB user upsert failed: {e}")
-
+    try:
+        db.upsert_user(uid, email or None)   # <-- was dict; now (uid, email)
+        st.session_state["uid_sidebar"] = uid
+        st.caption("User ready in DB ✅")
+    except Exception as e:
+        st.error(f"DB user upsert failed: {e}")
+        
 if st.button("Build my portfolio"):
     spinner = st.empty()
     msgs = [
