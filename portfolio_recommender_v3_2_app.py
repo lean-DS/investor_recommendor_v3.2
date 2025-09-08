@@ -412,31 +412,25 @@ if st.button("Build my portfolio"):
     }
 
 # ---- Save portfolio to DB ----
+# ---- Save portfolio to DB ----
 st.subheader("Save portfolio")
 if "last_res" in st.session_state and "last_meta" in st.session_state:
     default_name = f'{st.session_state["last_meta"]["index_choice"]} • {st.session_state["last_meta"]["risk_profile"]} • {pd.Timestamp.utcnow().date().isoformat()}'
     pf_name = st.text_input("Portfolio name", value=default_name)
 
-    can_save = True
-    # need uid from sidebar scope; re-read safely:
-    uid_for_save = st.session_state.get("uid_sidebar") if "uid_sidebar" in st.session_state else None
-    # fallback: use the current input if present
-    try:
-        uid_for_save = uid_for_save or uid
-    except NameError:
-        uid_for_save = None
-
-    if st.button("💾 Save to database", use_container_width=True, type="primary", disabled=not bool(uid_for_save)):
+    if st.button("💾 Save to database", use_container_width=True, type="primary", disabled=not bool(uid)):
         try:
             meta = dict(st.session_state["last_meta"])
             meta["name"] = pf_name
-            portfolio_id = db.save_portfolio(uid_for_save, meta, st.session_state["last_res"])
+            portfolio_id = db.save_portfolio(uid, meta, st.session_state["last_res"])
             st.success(f"Saved! Portfolio ID: {portfolio_id}")
         except Exception as e:
             st.error(f"Save failed: {e}")
+    elif not uid:
+        st.info("Sign in (or enter a dev uid) to save.")
 else:
     st.info("Build a portfolio first to enable saving.")
-
+    
 # ---- List my saved portfolios ----
 st.subheader("My portfolios")
 try:
