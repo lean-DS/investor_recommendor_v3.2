@@ -6,57 +6,56 @@ substitutions:
   _PROJECT: "fintech-inv-recomm"
 
 steps:
-  # Try to pull last image to seed the cache (won’t fail the build if missing)
+  # Seed cache (ignore if not found)
   - name: "gcr.io/cloud-builders/docker"
     entrypoint: "bash"
     args:
-      - "-lc"
+      - -lc
       - |
         docker pull ${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest || true
 
-  # Build using the pulled image as a cache source
+  # Build (use cache + ensure fresh base)
   - name: "gcr.io/cloud-builders/docker"
     args:
       [
         "build",
+        "--pull",
         "--cache-from",
         "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
-        "-t",
-        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
-        "-t",
-        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
+        "--build-arg","CACHE_BUST=$SHORT_SHA",
+        "-t","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
+        "-t","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
         ".",
       ]
 
-  # Push both the new digest and the latest tag
+  # Push both tags
   - name: "gcr.io/cloud-builders/docker"
-    args:
-      [
-        "push",
-        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
-      ]
+    args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"]
   - name: "gcr.io/cloud-builders/docker"
-    args:
-      [
-        "push",
-        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
-      ]
+    args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest"]
 
-  # Deploy to Cloud Run
+  # Deploy with unique revision & retry on conflict
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
-    entrypoint: gcloud
+    entrypoint: bash
     args:
-      [
-        "run","deploy","${_SERVICE}",
-        "--image","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
-        "--region","${_REGION}",
-        "--platform","managed",
-        "--allow-unauthenticated",
-        "--port","8080",
-        "--memory","512Mi",
-        "--cpu","1",
-        "--concurrency","80",
-      ]
+      - -lc
+      - |
+        set -e
+        for i in 1 2 3; do
+          gcloud run deploy "${_SERVICE}" \
+            --image "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA" \
+            --region "${_REGION}" \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --memory 512Mi \
+            --cpu 1 \
+            --concurrency 80 \
+            --revision-suffix "$SHORT_SHA" \
+            --quiet && break
+          echo "Deploy conflict, retrying in 6s (attempt $i/3)…"
+          sleep 6
+        done
 
 images:
   - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"
