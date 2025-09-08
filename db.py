@@ -12,6 +12,16 @@ from typing import Optional
 from google.cloud.sql.connector import Connector, IPTypes
 import sqlalchemy
 
+import db  # your db.py
+
+@st.cache_resource
+def _init_db():
+    db.ensure_schema()
+    db.enable_rls()
+    return True
+
+DB_READY = _init_db()
+
 # ---------- Connection ----------
 
 _connector: Optional[Connector] = None
