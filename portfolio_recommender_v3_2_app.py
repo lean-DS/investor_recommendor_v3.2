@@ -412,7 +412,7 @@ if st.button("Build my portfolio"):
         "amount_usd": float(amount),
     }
 
-# ---- Save portfolio to DB ----
+
 # ---- Save portfolio to DB ----
 st.subheader("Save portfolio")
 if "last_res" in st.session_state and "last_meta" in st.session_state:
