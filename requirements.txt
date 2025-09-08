@@ -38,6 +38,7 @@ streamlit==1.38.0
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
 gcsfs==2024.9.0
+streamlit-auth0
 
 # --- Utilities ---
 tqdm==4.66.5
