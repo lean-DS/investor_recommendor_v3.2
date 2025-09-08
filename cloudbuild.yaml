@@ -6,35 +6,25 @@ substitutions:
   _PROJECT: "fintech-inv-recomm"
 
 steps:
-  # Seed cache (ignore if not found)
-  - name: "gcr.io/cloud-builders/docker"
-    entrypoint: "bash"
-    args:
-      - -lc
-      - |
-        docker pull ${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest || true
-
-  # Build (use cache + ensure fresh base)
+  # Clean rebuild: no cache to ensure no stale code
   - name: "gcr.io/cloud-builders/docker"
     args:
       [
         "build",
+        "--no-cache",
         "--pull",
-        "--cache-from",
-        "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
-        "--build-arg","CACHE_BUST=$SHORT_SHA",
+        "--build-arg","GIT_SHA=$SHORT_SHA",
         "-t","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
         "-t","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
         ".",
       ]
 
-  # Push both tags
   - name: "gcr.io/cloud-builders/docker"
     args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"]
   - name: "gcr.io/cloud-builders/docker"
     args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest"]
 
-  # Deploy with unique revision & retry on conflict
+  # Deploy with a unique revision suffix; retry if there's a version conflict
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: bash
     args:
