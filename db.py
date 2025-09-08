@@ -6,23 +6,24 @@
 #   pg8000>=1.30
 
 import os
+from typing import Optional
+
 import numpy as np
 import pandas as pd
-from typing import Optional
 from google.cloud.sql.connector import Connector, IPTypes
 import sqlalchemy
-
 
 # ---------- Connection ----------
 
 _connector: Optional[Connector] = None
 _engine: Optional[sqlalchemy.Engine] = None
 
+
 def _creator():
+    """Create a pg8000 connection via Cloud SQL Python Connector."""
     global _connector
     if _connector is None:
         _connector = Connector()
-
     return _connector.connect(
         os.environ["INSTANCE_CONNECTION_NAME"],   # "project:region:instance"
         "pg8000",
@@ -32,20 +33,25 @@ def _creator():
         ip_type=IPTypes.PRIVATE if os.getenv("DB_PRIVATE_IP") == "1" else IPTypes.PUBLIC,
     )
 
+
 def get_engine() -> sqlalchemy.Engine:
+    """Lazily build a SQLAlchemy engine using the connector."""
     global _engine
     if _engine is None:
         _engine = sqlalchemy.create_engine(
-            "postgresql+pg8000://", creator=_creator,
-            pool_pre_ping=True, pool_recycle=1800
+            "postgresql+pg8000://",
+            creator=_creator,
+            pool_pre_ping=True,
+            pool_recycle=1800,
         )
     return _engine
+
 
 # ---------- One-time setup ----------
 
 def ensure_schema():
     """
-    Creates extensions, tables, constraints, and helpful indexes.
+    Create extensions, tables, constraints, and helpful indexes.
     Safe to run multiple times.
     """
     eng = get_engine()
@@ -99,61 +105,71 @@ def ensure_schema():
         CREATE INDEX IF NOT EXISTS idx_position_ticker    ON position(ticker);
         """)
 
+
 def enable_rls():
     """
     Enables row-level security and policies that isolate data by app user.
-    Your app must set:  SET LOCAL app.user_id = '<uuid>'  per request/txn.
+    Your app must call:  SET LOCAL app.user_id = '<uuid>' per request/transaction.
     """
     eng = get_engine()
     with eng.begin() as con:
         con.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
-        # RLS on portfolio/position
+
+        # Enable RLS
         con.exec_driver_sql("ALTER TABLE portfolio ENABLE ROW LEVEL SECURITY;")
         con.exec_driver_sql("ALTER TABLE position  ENABLE ROW LEVEL SECURITY;")
 
-        # Allow owner (matching app.user_id) to see their rows
+        # Portfolio RLS policy: enforce visibility and writes only for current user
+        con.exec_driver_sql("DROP POLICY IF EXISTS portfolio_isolation ON portfolio;")
         con.exec_driver_sql("""
-        DROP POLICY IF EXISTS portfolio_isolation ON portfolio;
         CREATE POLICY portfolio_isolation
         ON portfolio
-        USING (user_id::text = current_setting('app.user_id', true));
+        USING (user_id::text = current_setting('app.user_id', true))
+        WITH CHECK (user_id::text = current_setting('app.user_id', true));
         """)
+
+        # Position RLS policy: tie rows to portfolios owned by current user
+        con.exec_driver_sql("DROP POLICY IF EXISTS position_isolation ON position;")
         con.exec_driver_sql("""
-        DROP POLICY IF EXISTS position_isolation ON position;
         CREATE POLICY position_isolation
         ON position
         USING (portfolio_id IN (
-          SELECT id FROM portfolio
-          WHERE user_id::text = current_setting('app.user_id', true)
+            SELECT id FROM portfolio
+            WHERE user_id::text = current_setting('app.user_id', true)
+        ))
+        WITH CHECK (portfolio_id IN (
+            SELECT id FROM portfolio
+            WHERE user_id::text = current_setting('app.user_id', true)
         ));
         """)
 
+
 def _set_rls_user(con: sqlalchemy.Connection, uid: str):
-    """Call this at the start of each request/transaction."""
+    """Call this at the start of each request/transaction to scope queries."""
     con.exec_driver_sql("SET LOCAL app.user_id = %s", (uid,))
+
 
 # ---------- CRUD helpers ----------
 
 def upsert_user(uid: str, email: Optional[str]):
-    """
-    Insert or update a user record (id=email pair).
-    """
+    """Insert or update a user record (id/email pair)."""
     eng = get_engine()
     with eng.begin() as con:
-        # ensure a row exists with exact id/email
         con.exec_driver_sql("""
         INSERT INTO app_user(id, email)
         VALUES (%s, %s)
         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
         """, (uid, email))
 
+
 def save_portfolio(uid: str, meta: dict, res_df: pd.DataFrame, portfolio_name: Optional[str] = None) -> str:
     """
-    Persist a portfolio header + its holdings for the given user.
-    Returns portfolio_id (UUID).
-    meta expects: index_choice, risk_profile, horizon, amount_usd
-    res_df expects columns: ['ticker','asset_type','weight','alloc_$','Beta_vs_Benchmark',
-                             'Mom_6M','Mom_12M','Dividend_Yield_TTM','sentiment_z','final_score']
+    Persist a portfolio header + its holdings for the given user. Returns portfolio_id (UUID).
+
+    meta keys: index_choice, risk_profile, horizon, amount_usd, optional name
+    res_df columns expected (case-insensitive for Ticker):
+      ['Ticker' or 'ticker','asset_type','weight','alloc_$','Beta_vs_Benchmark',
+       'Mom_6M','Mom_12M','Dividend_Yield_TTM','sentiment_z','final_score']
     """
     name = portfolio_name or meta.get("name") or "My Portfolio"
     eng = get_engine()
@@ -172,6 +188,10 @@ def save_portfolio(uid: str, meta: dict, res_df: pd.DataFrame, portfolio_name: O
             meta.get("amount_usd"),
         )).scalar_one()
 
+        # Helper to read either 'Ticker' or 'ticker'
+        def _get_ticker(row: dict):
+            return row.get("Ticker") or row.get("ticker")
+
         # Insert holdings
         for r in res_df.fillna(np.nan).to_dict("records"):
             con.exec_driver_sql("""
@@ -182,7 +202,7 @@ def save_portfolio(uid: str, meta: dict, res_df: pd.DataFrame, portfolio_name: O
               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 pid,
-                r.get("ticker"),
+                _get_ticker(r),
                 r.get("asset_type"),
                 float(r.get("weight") or 0),
                 float(r.get("alloc_$") or 0),
@@ -195,7 +215,9 @@ def save_portfolio(uid: str, meta: dict, res_df: pd.DataFrame, portfolio_name: O
             ))
     return str(pid)
 
+
 def list_user_portfolios(uid: str) -> pd.DataFrame:
+    """List portfolios for a user (scoped by RLS)."""
     eng = get_engine()
     with eng.begin() as con:
         _set_rls_user(con, uid)
@@ -210,7 +232,9 @@ def list_user_portfolios(uid: str) -> pd.DataFrame:
         """
         return pd.read_sql(q, con)
 
+
 def get_portfolio_positions(uid: str, portfolio_id: str) -> pd.DataFrame:
+    """Return positions within a portfolio (scoped by RLS)."""
     eng = get_engine()
     with eng.begin() as con:
         _set_rls_user(con, uid)
