@@ -8,6 +8,16 @@ import streamlit as st
 st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
 st.title("Personalized Portfolio Builder v3.2")
 
+import db  # your db.py
+
+@st.cache_resource
+def _init_db():
+    db.ensure_schema()
+    db.enable_rls()
+    return True
+
+DB_READY = _init_db()
+
 # ============== GCS CONFIG ==============
 BUCKET = os.environ.get("GCS_DATA_BUCKET", "fintech-inv-recomm-portfolio-data")
 BASE   = os.environ.get("GCS_BASE_PREFIX", "portfolio_data")
