@@ -6,7 +6,7 @@ substitutions:
   _PROJECT: "fintech-inv-recomm"
 
 steps:
-  # Clean rebuild: no cache to ensure no stale code
+  # Build fresh (no cache) and bake commit SHA for provenance
   - name: "gcr.io/cloud-builders/docker"
     args:
       [
@@ -19,12 +19,13 @@ steps:
         ".",
       ]
 
+  # Push both tags
   - name: "gcr.io/cloud-builders/docker"
     args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"]
   - name: "gcr.io/cloud-builders/docker"
     args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest"]
 
-  # Deploy with a unique revision suffix; retry if there's a version conflict
+  # Deploy (with env vars + Cloud SQL attachment). Retries on revision conflict.
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: bash
     args:
@@ -42,6 +43,18 @@ steps:
             --cpu 1 \
             --concurrency 80 \
             --revision-suffix "$SHORT_SHA" \
+            --add-cloudsql-instances "fintech-inv-recomm:europe-west1:portfolio-postgres" \
+            --set-env-vars "GCS_DATA_BUCKET=fintech-inv-recomm-portfolio-data" \
+            --set-env-vars "GCS_BASE_PREFIX=portfolio_data" \
+            --set-env-vars "INSTANCE_CONNECTION_NAME=fintech-inv-recomm:europe-west1:portfolio-postgres" \
+            --set-env-vars "DB_USER=portfolio" \
+            --set-env-vars "DB_PASS=STRONG_APP_PASSWORD" \
+            --set-env-vars "DB_NAME=portfolio_app" \
+            --set-env-vars "DB_PRIVATE_IP=0" \
+            --set-env-vars "STREAMLIT_SERVER_HEADLESS=true" \
+            --set-env-vars "STREAMLIT_SERVER_ENABLE_CORS=false" \
+            --set-env-vars "STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false" \
+            --set-env-vars "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false" \
             --quiet && break
           echo "Deploy conflict, retrying in 6s (attempt $i/3)…"
           sleep 6
