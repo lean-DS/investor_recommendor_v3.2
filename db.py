@@ -1,11 +1,12 @@
 # db.py
-# deps (requirements.txt):
+# Runtime deps (in requirements.txt):
 #   google-cloud-sql-connector[pg8000]>=1.10
 #   SQLAlchemy>=2.0
-#   pandas>=2.1
 #   pg8000>=1.30
+#   pandas>=2.1
 
 import os
+import re
 from typing import Optional
 
 import numpy as np
@@ -17,7 +18,6 @@ import sqlalchemy
 
 _connector: Optional[Connector] = None
 _engine: Optional[sqlalchemy.Engine] = None
-
 
 def _creator():
     """Create a pg8000 connection via Cloud SQL Python Connector."""
@@ -32,7 +32,6 @@ def _creator():
         db=os.environ["DB_NAME"],
         ip_type=IPTypes.PRIVATE if os.getenv("DB_PRIVATE_IP") == "1" else IPTypes.PUBLIC,
     )
-
 
 def get_engine() -> sqlalchemy.Engine:
     """Lazily build a SQLAlchemy engine using the connector."""
@@ -56,18 +55,20 @@ def ensure_schema():
     """
     eng = get_engine()
     with eng.begin() as con:
-        # uuid generator
+        # UUID generator
         con.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
 
-        # users
+        # Users (now supports Google OIDC subject + display name)
         con.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS app_user (
-          id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          email TEXT UNIQUE
+          id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          email      TEXT UNIQUE,
+          google_sub TEXT UNIQUE,
+          name       TEXT
         );
         """)
 
-        # portfolios
+        # Portfolios
         con.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS portfolio (
           id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -85,7 +86,7 @@ def ensure_schema():
           ON portfolio(user_id);
         """)
 
-        # holdings (positions)
+        # Holdings (positions)
         con.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS position (
           id            BIGSERIAL PRIMARY KEY,
@@ -109,7 +110,7 @@ def ensure_schema():
 def enable_rls():
     """
     Enables row-level security and policies that isolate data by app user.
-    Your app must call:  SET LOCAL app.user_id = '<uuid>' per request/transaction.
+    Your app must call _set_rls_user(con, '<uuid>') per request/transaction.
     """
     eng = get_engine()
     with eng.begin() as con:
@@ -119,7 +120,7 @@ def enable_rls():
         con.exec_driver_sql("ALTER TABLE portfolio ENABLE ROW LEVEL SECURITY;")
         con.exec_driver_sql("ALTER TABLE position  ENABLE ROW LEVEL SECURITY;")
 
-        # Portfolio RLS policy: enforce visibility and writes only for current user
+        # Portfolio RLS policy
         con.exec_driver_sql("DROP POLICY IF EXISTS portfolio_isolation ON portfolio;")
         con.exec_driver_sql("""
         CREATE POLICY portfolio_isolation
@@ -128,7 +129,7 @@ def enable_rls():
         WITH CHECK (user_id::text = current_setting('app.user_id', true));
         """)
 
-        # Position RLS policy: tie rows to portfolios owned by current user
+        # Position RLS policy
         con.exec_driver_sql("DROP POLICY IF EXISTS position_isolation ON position;")
         con.exec_driver_sql("""
         CREATE POLICY position_isolation
@@ -145,21 +146,71 @@ def enable_rls():
 
 
 def _set_rls_user(con: sqlalchemy.Connection, uid: str):
-    """Call this at the start of each request/transaction to scope queries."""
-    con.exec_driver_sql("SET LOCAL app.user_id = %s", (uid,))
+    """
+    Scope all subsequent queries on this connection/txn to the given user UUID.
+    Uses set_config(), which safely accepts bind parameters (unlike SET LOCAL ... = %s).
+    """
+    con.exec_driver_sql("SELECT set_config('app.user_id', %s, true)", (uid,))
 
 
 # ---------- CRUD helpers ----------
 
-def upsert_user(uid: str, email: Optional[str]):
-    """Insert or update a user record (id/email pair)."""
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+def upsert_user(
+    uid: Optional[str],
+    email: Optional[str],
+    google_sub: Optional[str] = None,
+    name: Optional[str] = None,
+) -> str:
+    """
+    Upsert a user and return the canonical app_user.id (UUID).
+
+    Priority:
+      1) If google_sub is provided (OAuth), key by google_sub.
+      2) Else if uid is a valid UUID, upsert by id.
+      3) Else fall back to email (demo/dev), letting DB generate UUID.
+
+    Returns:
+      app_user.id as a string UUID.
+    """
     eng = get_engine()
     with eng.begin() as con:
-        con.exec_driver_sql("""
-        INSERT INTO app_user(id, email)
-        VALUES (%s, %s)
-        ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
-        """, (uid, email))
+        if google_sub:
+            return con.exec_driver_sql(
+                """
+                INSERT INTO app_user (google_sub, email, name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (google_sub)
+                  DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name
+                RETURNING id
+                """,
+                (google_sub, email, name),
+            ).scalar_one()
+
+        if uid and UUID_RE.match(uid):
+            return con.exec_driver_sql(
+                """
+                INSERT INTO app_user (id, email, name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (id)
+                  DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name
+                RETURNING id
+                """,
+                (uid, email, name),
+            ).scalar_one()
+
+        # Demo/dev: key by email, DB generates UUID
+        return con.exec_driver_sql(
+            """
+            INSERT INTO app_user (email, name)
+            VALUES (%s, %s)
+            ON CONFLICT (email)
+              DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            (email, name),
+        ).scalar_one()
 
 
 def save_portfolio(uid: str, meta: dict, res_df: pd.DataFrame, portfolio_name: Optional[str] = None) -> str:
@@ -176,43 +227,48 @@ def save_portfolio(uid: str, meta: dict, res_df: pd.DataFrame, portfolio_name: O
     with eng.begin() as con:
         _set_rls_user(con, uid)
 
-        pid = con.exec_driver_sql("""
-          INSERT INTO portfolio(user_id, name, index_choice, risk_profile, horizon, amount_usd)
-          VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
-        """, (
-            uid,
-            name,
-            meta.get("index_choice"),
-            meta.get("risk_profile"),
-            meta.get("horizon"),
-            meta.get("amount_usd"),
-        )).scalar_one()
+        pid = con.exec_driver_sql(
+            """
+            INSERT INTO portfolio(user_id, name, index_choice, risk_profile, horizon, amount_usd)
+            VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+            """,
+            (
+                uid,
+                name,
+                meta.get("index_choice"),
+                meta.get("risk_profile"),
+                meta.get("horizon"),
+                meta.get("amount_usd"),
+            ),
+        ).scalar_one()
 
-        # Helper to read either 'Ticker' or 'ticker'
         def _get_ticker(row: dict):
             return row.get("Ticker") or row.get("ticker")
 
         # Insert holdings
         for r in res_df.fillna(np.nan).to_dict("records"):
-            con.exec_driver_sql("""
-              INSERT INTO position(
-                portfolio_id, ticker, asset_type, weight, alloc_usd, beta,
-                mom_6m, mom_12m, div_yield_ttm, sentiment_z, final_score
-              )
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                pid,
-                _get_ticker(r),
-                r.get("asset_type"),
-                float(r.get("weight") or 0),
-                float(r.get("alloc_$") or 0),
-                float(r.get("Beta_vs_Benchmark") or 0),
-                float(r.get("Mom_6M") or 0),
-                float(r.get("Mom_12M") or 0),
-                float(r.get("Dividend_Yield_TTM") or 0),
-                float(r.get("sentiment_z") or 0),
-                float(r.get("final_score") or 0),
-            ))
+            con.exec_driver_sql(
+                """
+                INSERT INTO position(
+                  portfolio_id, ticker, asset_type, weight, alloc_usd, beta,
+                  mom_6m, mom_12m, div_yield_ttm, sentiment_z, final_score
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    pid,
+                    _get_ticker(r),
+                    r.get("asset_type"),
+                    float(r.get("weight") or 0),
+                    float(r.get("alloc_$") or 0),
+                    float(r.get("Beta_vs_Benchmark") or 0),
+                    float(r.get("Mom_6M") or 0),
+                    float(r.get("Mom_12M") or 0),
+                    float(r.get("Dividend_Yield_TTM") or 0),
+                    float(r.get("sentiment_z") or 0),
+                    float(r.get("final_score") or 0),
+                ),
+            )
     return str(pid)
 
 
@@ -224,7 +280,7 @@ def list_user_portfolios(uid: str) -> pd.DataFrame:
         q = """
           SELECT p.id AS portfolio_id, p.name, p.created_at,
                  p.index_choice, p.risk_profile, p.horizon, p.amount_usd,
-                 count(o.id) AS n_holdings
+                 COUNT(o.id) AS n_holdings
           FROM portfolio p
           LEFT JOIN position o ON o.portfolio_id = p.id
           GROUP BY p.id
