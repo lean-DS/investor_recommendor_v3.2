@@ -4,28 +4,28 @@ substitutions:
   _IMAGE: "portfolio-app"
   _SERVICE: "portfolio"
   _PROJECT: "fintech-inv-recomm"
+  # Provide these in your Cloud Build trigger substitutions or as defaults
+  _GOOGLE_CLIENT_ID: "YOUR_CLIENT_ID"
+  _GOOGLE_CLIENT_SECRET: "YOUR_CLIENT_SECRET"
+  _OAUTH_REDIRECT_URI: "https://portfolio-<hash>-<region>-a.run.app/"  # adjust to your URL
 
 steps:
-  # Build fresh (no cache) and bake commit SHA for provenance
+  # Build and bake commit SHA
   - name: "gcr.io/cloud-builders/docker"
     args:
       [
         "build",
-        "--no-cache",
         "--pull",
         "--build-arg","GIT_SHA=$SHORT_SHA",
         "-t","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA",
-        "-t","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest",
         ".",
       ]
 
-  # Push both tags
+  # Push the commit tag
   - name: "gcr.io/cloud-builders/docker"
     args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"]
-  - name: "gcr.io/cloud-builders/docker"
-    args: ["push","${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest"]
 
-  # Deploy (with env vars + Cloud SQL attachment). Retries on revision conflict.
+  # Deploy (env, Cloud SQL, traffic 100% to latest)
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
     entrypoint: bash
     args:
@@ -42,6 +42,8 @@ steps:
             --memory 512Mi \
             --cpu 1 \
             --concurrency 80 \
+            --max-instances 3 \
+            --traffic latest=100 \
             --revision-suffix "$SHORT_SHA" \
             --add-cloudsql-instances "fintech-inv-recomm:europe-west1:portfolio-postgres" \
             --set-env-vars "GCS_DATA_BUCKET=fintech-inv-recomm-portfolio-data" \
@@ -55,6 +57,10 @@ steps:
             --set-env-vars "STREAMLIT_SERVER_ENABLE_CORS=false" \
             --set-env-vars "STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false" \
             --set-env-vars "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false" \
+            --set-env-vars "GOOGLE_CLIENT_ID=${_GOOGLE_CLIENT_ID}" \
+            --set-env-vars "GOOGLE_CLIENT_SECRET=${_GOOGLE_CLIENT_SECRET}" \
+            --set-env-vars "OAUTH_REDIRECT_URI=${_OAUTH_REDIRECT_URI}" \
+            --service-account "portfolio-runner@${_PROJECT}.iam.gserviceaccount.com" \
             --quiet && break
           echo "Deploy conflict, retrying in 6s (attempt $i/3)…"
           sleep 6
@@ -62,7 +68,6 @@ steps:
 
 images:
   - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:$SHORT_SHA"
-  - "${_REGION}-docker.pkg.dev/${_PROJECT}/${_REPO}/${_IMAGE}:latest"
 
 options:
   logging: CLOUD_LOGGING_ONLY
