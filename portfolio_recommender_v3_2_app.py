@@ -4,9 +4,12 @@ import time
 import numpy as np
 import pandas as pd
 import streamlit as st
+import auth
 
 st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
-st.title("Personalized Portfolio Builder v3.2")
+st.title("Personalized Portfolio Builder v3.2.0")
+
+auth.handle_oauth_callback()
 
 # ===== DB init =====
 import db  # your db.py
@@ -302,14 +305,17 @@ with st.sidebar:
         "Risk Appetite",
         ["Conservative", "Moderate", "Aggressive"],
         index=["Conservative", "Moderate", "Aggressive"].index(recommended),
-        help="Default set from age; feel free to adjust."
+        help="Default set from age; feel free to adjust.",
     )
     st.caption(f"Recommended from age: **{recommended}**")
 
     st.divider()
-    st.caption("User (temporary until auth)")
-    uid   = st.text_input("User ID", value="demo-user-1")
-    email = st.text_input("Email (optional)", value="demo@example.com")
+    st.caption("Account")
+    # Render login / profile; this stores the canonical UUID in session on success
+    auth.login_section()
+
+# Canonical UUID for RLS-aware DB calls (None if not signed-in)
+uid = auth.get_current_uid()
 
     if uid:
         try:
@@ -420,32 +426,32 @@ if "last_res" in st.session_state and "last_meta" in st.session_state:
     pf_name = st.text_input("Portfolio name", value=default_name)
 
     if st.button("💾 Save to database", use_container_width=True, type="primary", disabled=not bool(uid)):
-        try:
-            meta = dict(st.session_state["last_meta"])
-            meta["name"] = pf_name
-            portfolio_id = db.save_portfolio(uid, meta, st.session_state["last_res"])
-            st.success(f"Saved! Portfolio ID: {portfolio_id}")
-        except Exception as e:
-            st.error(f"Save failed: {e}")
+        if not uid:
+            st.warning("Please sign in to save your portfolio.")
+        else:
+            try:
+                meta = dict(st.session_state["last_meta"])
+                meta["name"] = pf_name
+                portfolio_id = db.save_portfolio(uid, meta, st.session_state["last_res"])
+                st.success(f"Saved! Portfolio ID: {portfolio_id}")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
     elif not uid:
-        st.info("Sign in (or enter a dev uid) to save.")
+        st.info("Sign in to save.")
 else:
     st.info("Build a portfolio first to enable saving.")
     
 # ---- List my saved portfolios ----
 st.subheader("My portfolios")
 try:
-    uid_list = None
-    try:
-        uid_list = uid
-    except NameError:
-        uid_list = None
-    if uid_list:
-        pf = db.list_user_portfolios(uid_list)
+    if uid:
+        pf = db.list_user_portfolios(uid)
         if pf.empty:
             st.info("No saved portfolios yet.")
         else:
             st.dataframe(pf, use_container_width=True)
+    else:
+        st.info("Sign in to view your saved portfolios.")
 except Exception as e:
     st.error(f"List failed: {e}")
 
