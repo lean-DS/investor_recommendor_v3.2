@@ -6,6 +6,9 @@ import pandas as pd
 import streamlit as st
 import auth
 
+from dotenv import load_dotenv
+load_dotenv()
+
 st.set_page_config(page_title="Personalized Portfolio", page_icon="📈", layout="wide")
 st.title("Personalized Portfolio Builder v3.2.0")
 
