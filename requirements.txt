@@ -5,16 +5,16 @@ scipy==1.13.1
 scikit-learn==1.5.1
 pyarrow==17.0.0
 
-# --- Viz ---
+# --- Viz (optional if not used) ---
 matplotlib==3.9.2
 seaborn==0.13.2
 plotly==5.23.0
 
-# --- Data sources ---
+# --- Data sources (optional if not used) ---
 yfinance==0.2.40
 pandas-datareader==0.10.0
 
-# --- Time series ---
+# --- Time series (optional if not used) ---
 statsmodels==0.14.2
 pmdarima==2.0.4
 
@@ -23,15 +23,14 @@ streamlit==1.38.0
 gcsfs==2024.9.0
 requests>=2.32.0
 
-# OAuth
+# --- OAuth ---
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
 
-# --- DB (Cloud SQL Postgres via pg8000) ---
-SQLAlchemy
-cloud-sql-python-connector[pg]
-psycopg2-binary
-pg8000==1.31.2
+# --- Cloud SQL (pg8000 stack) ---
+google-cloud-sql-connector[pg8000]>=1.10
+SQLAlchemy>=2.0
+pg8000>=1.30
 
-# --- Optional (remove if not used in the app runtime) ---
-# firebase-admin
+# --- Optional (remove if not used) ---
+firebase-admin
