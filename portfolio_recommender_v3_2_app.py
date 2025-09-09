@@ -317,13 +317,10 @@ with st.sidebar:
 # Canonical UUID for RLS-aware DB calls (None if not signed-in)
 uid = auth.get_current_uid()
 
-    if uid:
-        try:
-            db.upsert_user(uid, email or None)  # pass (uid, email)
-            st.session_state["uid_sidebar"] = uid
-            st.caption("User ready in Database")
-        except Exception as e:
-            st.error(f"DB user upsert failed: {e}")
+if uid:
+    st.caption("Successfully Signed In")
+else:
+    st.caption("You’re not signed in, you can build, but must sign in to save.")
         
 if st.button("Build my portfolio"):
     spinner = st.empty()
