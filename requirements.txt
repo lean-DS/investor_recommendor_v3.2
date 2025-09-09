@@ -26,6 +26,7 @@ requests>=2.32.0
 # --- OAuth ---
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
+python-dotenv>=1.0.0
 
 # --- Cloud SQL (pg8000 stack) ---
 google-cloud-sql-connector[pg8000]>=1.10
